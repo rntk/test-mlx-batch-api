@@ -2,6 +2,7 @@ from mlx_lm import load
 from mlx_lm.generate import BatchGenerator, wired_limit, generation_stream
 import sys
 import os
+import time
 sys.path.insert(0, '/Users/rnt/dev/python/mlx/txt-splitt/src')
 
 from txt_splitt import BatchPipeline, RegexSentenceSplitter, BracketMarker, StrictGapHandler, SizeBasedChunker
@@ -106,14 +107,31 @@ def main():
     
     # Run batch inference
     print("Running batch inference...")
+    total_tokens = 0
+    t_start = time.perf_counter()
     with wired_limit(model, [generation_stream]):
         uids = gen.insert(prompts, max_tokens=24000)
         results = {uid: [] for uid in uids}
-    
+        prompt_tokens = {uid: len(prompts[i]) for i, uid in enumerate(uids)}
+
         while responses := gen.next():
             for r in responses:
                 if r.finish_reason is None:
                     results[r.uid].append(r.token)
+                    total_tokens += 1
+    t_elapsed = time.perf_counter() - t_start
+
+    # Print generation metrics
+    tps = total_tokens / t_elapsed if t_elapsed > 0 else 0.0
+    print(f"\n--- Generation Metrics ---")
+    print(f"  Elapsed time   : {t_elapsed:.2f}s")
+    print(f"  Total tokens   : {total_tokens}")
+    print(f"  Throughput     : {tps:.1f} tok/s")
+    print(f"  Prompts        : {len(uids)}")
+    for uid, tokens in results.items():
+        gen_toks = len(tokens)
+        prompt_toks = prompt_tokens.get(uid, 0)
+        print(f"  UID {uid:3d}: prompt={prompt_toks} gen={gen_toks} total={prompt_toks+gen_toks}")
     
     # Save results to file
     output_file = "results.txt"
