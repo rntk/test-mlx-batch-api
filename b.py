@@ -1,7 +1,7 @@
 from mlx_lm import load
-from mlx_lm.generate import BatchGenerator, wired_limit, generation_stream, generate_step
+from mlx_lm.generate import BatchGenerator, wired_limit, generation_stream
 from mlx_lm.models import cache as cache_module
-from mlx_lm.models.cache import KVCache, RotatingKVCache, save_prompt_cache, load_prompt_cache
+from mlx_lm.models.cache import KVCache, save_prompt_cache, load_prompt_cache
 import mlx.core as mx
 import sys
 import os
@@ -61,7 +61,7 @@ def find_common_prefix_length(token_lists):
 def build_and_save_prefix_cache(model, tokenizer, full_prompts_tokens, cache_file: str):
     """
     Compute the shared-prefix KV cache from the first 2 prompts,
-    prefill it using generate_step(max_tokens=0), and save to disk.
+    prefill it using model() directly, and save to disk.
     Returns (prefix_cache, common_len).
     """
     # Use up to 2 prompts to find the common prefix
@@ -75,23 +75,22 @@ def build_and_save_prefix_cache(model, tokenizer, full_prompts_tokens, cache_fil
     if common_len == 0:
         print("  Warning: no common prefix found; cache will be empty.")
 
-    prefix_tokens = mx.array(full_prompts_tokens[0][:common_len])
+    prefix_tokens = full_prompts_tokens[0][:common_len]
     prefix_cache = cache_module.make_prompt_cache(model)
 
     t0 = time.perf_counter()
-    for _ in generate_step(
-        prefix_tokens,
-        model,
-        max_tokens=0,
-        prompt_cache=prefix_cache,
-        prefill_step_size=4096,
-    ):
-        pass
+    remaining = prefix_tokens
+    with mx.stream(generation_stream):
+        while len(remaining) > 0:
+            n = min(4096, len(remaining))
+            model(mx.array(remaining[:n])[None], cache=prefix_cache)
+            mx.eval([c.state for c in prefix_cache])
+            remaining = remaining[n:]
     t1 = time.perf_counter()
 
-    print(f"  Prefill: {common_len} tokens in {t1 - t0:.2f}s "
-          f"({common_len / (t1 - t0):.0f} tok/s)" if (t1 - t0) > 0 else
-          f"  Prefill: {common_len} tokens")
+    n_tokens = len(prefix_tokens)
+    print(f"  Prefix prefill: {n_tokens} tokens in {t1 - t0:.2f}s "
+          f"({n_tokens / (t1 - t0):.0f} tok/s)")
 
     print(f"  Saving cache to {cache_file} ...")
     save_prompt_cache(cache_file, prefix_cache, {"model": MODEL_PATH})
@@ -107,41 +106,13 @@ def load_prefix_cache(cache_file: str):
 
 
 def clone_cache(prompt_cache):
-    """
-    Deep-clone a per-prompt KV cache list preserving the original cache types.
-
-    KVCache layers are cloned by slicing to the filled portion (offset).
-    RotatingKVCache layers (sliding-window attention) are put into temporal
-    (chronological) order first and cloned so that _idx == keys.shape[2].
-    BatchRotatingKVCache.merge requires this invariant to copy data correctly.
-
-    NOTE: The caller must call mx.eval([c.state for c in prompt_cache]) once
-    before the cloning loop to force evaluation of lazy cache updates.
-    """
+    """Deep-clone a single-sequence KV cache so each prompt gets its own copy."""
     cloned = []
     for c in prompt_cache:
-        if isinstance(c, RotatingKVCache):
-            # The circular buffer may be rotated; put it in chronological order
-            # so that _idx == keys.shape[2] after the clone.
-            if c.keys is not None:
-                temporal_keys = mx.contiguous(c._temporal_order(c.keys))
-                temporal_values = mx.contiguous(c._temporal_order(c.values))
-                new_c = RotatingKVCache(max_size=c.max_size, keep=c.keep)
-                new_c.keys = temporal_keys
-                new_c.values = temporal_values
-                new_c.offset = c.offset  # absolute position (used for RoPE)
-                new_c._idx = temporal_keys.shape[2]  # = size() tokens, in order
-            else:
-                new_c = RotatingKVCache(max_size=c.max_size, keep=c.keep)
-        else:
-            # KVCache: slice to exactly offset tokens (zero-copy view).
-            # BatchKVCache.merge() will copy into its own batch buffer,
-            # so contiguous copies here are redundant.
-            new_c = KVCache()
-            if c.keys is not None:
-                new_c.keys = c.keys[..., :c.offset, :]
-                new_c.values = c.values[..., :c.offset, :]
-            new_c.offset = c.offset
+        new_c = KVCache()
+        new_c.keys = c.keys[..., :c.offset, :] if c.keys is not None else None
+        new_c.values = c.values[..., :c.offset, :] if c.values is not None else None
+        new_c.offset = c.offset
         cloned.append(new_c)
     return cloned
 
