@@ -18,6 +18,13 @@ import batch_api
 MODEL_PATH = "/Users/rnt/dev/models/openai/gpt-oss-20b-mlx-Q8"
 DEFAULT_BATCHES_DIR = "./batches"
 
+# Dynamic chunk sizing — keep total prompt tokens per chunk within budget
+# to avoid GPU OOM.  b.py caps each prompt at ~12K chars (~3K tokens) so
+# 48 prompts ≈ 150K tokens fits comfortably.  Here prompts can be
+# arbitrarily large, so we adapt the chunk size instead.
+MAX_CHUNK_PROMPT_TOKENS = 150_000   # total prompt tokens per chunk
+DEFAULT_MAX_CHUNK_SIZE = 48         # upper bound on prompts per chunk
+
 
 def get_cache_file_path(batch_dir: Path) -> str:
     """Return the prompt cache file path stored inside the batch directory."""
@@ -32,6 +39,32 @@ def resolve_cache_file_path(base_cache_file: str) -> str:
     if os.path.exists(safetensors_path):
         return safetensors_path
     return base_cache_file
+
+
+def compute_dynamic_chunks(token_lengths,
+                           max_prompt_tokens=MAX_CHUNK_PROMPT_TOKENS,
+                           max_chunk_size=DEFAULT_MAX_CHUNK_SIZE):
+    """Split prompt indices into variable-size chunks that respect a total
+    token budget *and* a maximum chunk size.  Returns a list of lists of
+    global prompt indices."""
+    chunks = []
+    current: list[int] = []
+    current_tokens = 0
+    for i, tok_len in enumerate(token_lengths):
+        # If adding this prompt would exceed either limit, start a new chunk
+        # (unless the current chunk is empty — a single huge prompt still
+        # gets its own chunk).
+        if current and (current_tokens + tok_len > max_prompt_tokens
+                        or len(current) >= max_chunk_size):
+            chunks.append(current)
+            current = [i]
+            current_tokens = tok_len
+        else:
+            current.append(i)
+            current_tokens += tok_len
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 def find_common_prefix_length(token_lists):
@@ -186,14 +219,13 @@ def process_batch(model, tokenizer, batch_item: dict):
         return {'prompts': 0, 'sentences': 0, 'tokens': 0, 'time': 0.0}
     
     total_sentences = sum(len(re.findall(r'[.!?]+', p)) for p in prompts_text)
-    
-    # Tokenize all prompts
-    full_prompts_tokens = []
-    for idx, p in enumerate(prompts_text):
+
+    # Helper: tokenize a single prompt by its index
+    def tokenize_prompt(idx):
         orig = line_data[idx]
         url = orig.get("url", "")
         body = orig.get("body", {})
-        # Responses API format: build messages from input + optional instructions
+        p = prompts_text[idx]
         if url == "/v1/responses" or ("input" in body and "messages" not in body):
             raw_input = body.get("input", "")
             instructions = body.get("instructions", None)
@@ -201,12 +233,10 @@ def process_batch(model, tokenizer, batch_item: dict):
             if instructions:
                 msgs.append({"role": "system", "content": instructions})
             if isinstance(raw_input, list):
-                # ResponseInputItem list — may already be message-shaped
                 for item in raw_input:
                     if isinstance(item, dict) and "role" in item:
                         content = item.get("content", "")
                         if isinstance(content, list):
-                            # Flatten content parts to a single string
                             text_parts = []
                             for c in content:
                                 if isinstance(c, dict):
@@ -217,11 +247,9 @@ def process_batch(model, tokenizer, batch_item: dict):
                         else:
                             msgs.append({"role": item["role"], "content": content})
                     else:
-                        # Plain string item — treat as user message
                         msgs.append({"role": "user", "content": str(item)})
             else:
                 msgs.append({"role": "user", "content": str(raw_input)})
-        # Chat Completions format
         elif "messages" in body:
             msgs = body["messages"]
         else:
@@ -229,121 +257,125 @@ def process_batch(model, tokenizer, batch_item: dict):
         formatted = tokenizer.apply_chat_template(
             msgs, add_generation_prompt=True, tokenize=False
         )
-        full_prompts_tokens.append(tokenizer.encode(formatted))
-    
+        return tokenizer.encode(formatted)
+
+    # Tokenize ALL prompts upfront so we can plan chunk sizes
+    print(f"Tokenizing {len(prompts_text)} prompts...")
+    all_tokens = [tokenize_prompt(i) for i in range(len(prompts_text))]
+    token_lengths = [len(t) for t in all_tokens]
+    print(f"  Token lengths — min: {min(token_lengths)}, max: {max(token_lengths)}, "
+          f"avg: {sum(token_lengths)//len(token_lengths)}, total: {sum(token_lengths)}")
+
     # Handle KV cache prefix optimization — cache is kept in the batch directory
+    # Build/load prefix cache once using first 2 prompts as a sample
     base_cache_file = get_cache_file_path(batch_dir)
     cache_file = resolve_cache_file_path(base_cache_file)
-    
+
     if os.path.exists(cache_file):
         print(f"--- Loading Shared Prefix Cache from {cache_file} ---")
         prefix_cache, meta = load_prefix_cache(cache_file)
         common_len = prefix_cache[0].offset if prefix_cache else 0
     else:
         prefix_cache, common_len = build_and_save_prefix_cache(
-            model, tokenizer, full_prompts_tokens, base_cache_file
+            model, tokenizer, all_tokens[:2], base_cache_file
         )
-    
-    if common_len > 0 and len(full_prompts_tokens) > 1:
-        suffix_prompts = [toks[common_len:] for toks in full_prompts_tokens]
-        mx.eval([c.state for c in prefix_cache])
-        caches = [clone_cache(prefix_cache) for _ in suffix_prompts]
-    else:
-        suffix_prompts = full_prompts_tokens
-        caches = None
-    
-    # Batch inference
-    gen = BatchGenerator(
-        model,
-        stop_tokens=set(tokenizer.eos_token_ids),
-        completion_batch_size=48,
-        prefill_batch_size=12,
-        prefill_step_size=4096,
-    )
-    
+
+    # Compute dynamic chunks based on token budget
+    dynamic_chunks = compute_dynamic_chunks(token_lengths)
+    num_chunks = len(dynamic_chunks)
+
+    # Log chunk size summary
+    print(f"  Dynamic chunking: {num_chunks} chunks")
+    for i, chunk_indices in enumerate(dynamic_chunks):
+        chunk_size = len(chunk_indices)
+        chunk_prompt_tokens = sum(token_lengths[j] for j in chunk_indices)
+        print(f"    Chunk {i+1}: {chunk_size} prompts, ~{chunk_prompt_tokens} tokens")
+
+    # Process prompts in dynamically-sized chunks, accumulating results
+    all_results = []
     total_tokens = 0
     t_start = time.perf_counter()
-    results_dict = {}
-    
-    with wired_limit(model, [generation_stream]):
-        uids = gen.insert(suffix_prompts, max_tokens=24000, caches=caches)
-        results_dict = {uid: [] for uid in uids}
-        
-        while responses := gen.next():
-            for r in responses:
-                if r.finish_reason is None:
-                    results_dict[r.uid].append(r.token)
-                    total_tokens += 1
-    
-    t_elapsed = time.perf_counter() - t_start
-    tps = total_tokens / t_elapsed if t_elapsed > 0 else 0.0
 
-    print(f"  Batch {batch_dir.name}: {len(prompts_text)} prompts, {total_sentences} sentences, "
-          f"{total_tokens} tokens, {t_elapsed:.2f}s, {tps:.1f} tok/s")
+    print(f"Starting batch generation: {len(prompts_text)} prompts in {num_chunks} chunks")
 
-    # Build output records and mark batch complete
-    results = []
-    for idx, (uid, tokens) in enumerate(results_dict.items()):
-        decoded = tokenizer.decode(tokens)
-        orig = line_data[idx]
-        url = orig.get("url", "")
-        body = orig.get("body", {})
-        custom_id = orig.get("custom_id", str(idx))
-        now = int(time.time())
+    for chunk_idx, chunk_indices in enumerate(dynamic_chunks):
+        chunk_size = len(chunk_indices)
+        chunk_prompt_tokens = sum(token_lengths[i] for i in chunk_indices)
 
-        if url == "/v1/responses" or ("input" in body and "messages" not in body):
-            # Responses API output format
-            model_id = body.get("model", MODEL_PATH)
-            response_body = {
-                "id": f"resp_{uuid.uuid4().hex}",
-                "object": "response",
-                "created_at": now,
-                "model": model_id,
-                "output": [
-                    {
-                        "type": "message",
-                        "id": f"msg_{uuid.uuid4().hex}",
-                        "role": "assistant",
-                        "content": [
-                            {"type": "output_text", "text": decoded, "annotations": []}
-                        ],
-                        "status": "completed",
-                    }
-                ],
-                "status": "completed",
-                "usage": {
-                    "input_tokens": len(full_prompts_tokens[idx]),
-                    "output_tokens": len(tokens),
-                    "total_tokens": len(full_prompts_tokens[idx]) + len(tokens),
-                },
-            }
-            record = {
-                "id": f"batch_req_{uuid.uuid4().hex}",
-                "custom_id": custom_id,
-                "response": {"status_code": 200, "request_id": f"req_{uuid.uuid4().hex}", "body": response_body},
-                "error": None,
-            }
-        elif "messages" in body or url in ("/v1/chat/completions", ""):
-            # Chat Completions output format (if it was a batch API request)
-            if "custom_id" in orig:
+        print(f"  Chunk {chunk_idx + 1}/{num_chunks}: {chunk_size} prompts "
+              f"(indices {chunk_indices[0]}-{chunk_indices[-1]}, "
+              f"{chunk_prompt_tokens} prompt tokens)")
+        print(f"    Processing chunk with {chunk_size} prompts...")
+
+        chunk_tokens = [all_tokens[i] for i in chunk_indices]
+
+        # Build suffix prompts and clone caches for this chunk
+        if common_len > 0 and chunk_size > 1:
+            suffix_prompts = [toks[common_len:] for toks in chunk_tokens]
+            mx.eval([c.state for c in prefix_cache])
+            caches = [clone_cache(prefix_cache) for _ in suffix_prompts]
+        else:
+            suffix_prompts = chunk_tokens
+            caches = None
+
+        # Batch inference for this chunk
+        gen = BatchGenerator(
+            model,
+            stop_tokens=set(tokenizer.eos_token_ids),
+            completion_batch_size=chunk_size,
+            prefill_batch_size=min(12, chunk_size),
+            prefill_step_size=4096,
+        )
+
+        chunk_tokens_generated = 0
+        chunk_results_dict = {}
+
+        with wired_limit(model, [generation_stream]):
+            uids = gen.insert(suffix_prompts, max_tokens=24000, caches=caches)
+            chunk_results_dict = {uid: [] for uid in uids}
+
+            while responses := gen.next():
+                for r in responses:
+                    if r.finish_reason is None:
+                        chunk_results_dict[r.uid].append(r.token)
+                        chunk_tokens_generated += 1
+
+        total_tokens += chunk_tokens_generated
+
+        # Build output records for this chunk
+        for local_idx, (uid, tokens) in enumerate(chunk_results_dict.items()):
+            global_idx = chunk_indices[local_idx]
+            decoded = tokenizer.decode(tokens)
+            orig = line_data[global_idx]
+            url = orig.get("url", "")
+            body = orig.get("body", {})
+            custom_id = orig.get("custom_id", str(global_idx))
+            now = int(time.time())
+
+            if url == "/v1/responses" or ("input" in body and "messages" not in body):
+                # Responses API output format
                 model_id = body.get("model", MODEL_PATH)
                 response_body = {
-                    "id": f"chatcmpl-{uuid.uuid4().hex}",
-                    "object": "chat.completion",
-                    "created": now,
+                    "id": f"resp_{uuid.uuid4().hex}",
+                    "object": "response",
+                    "created_at": now,
                     "model": model_id,
-                    "choices": [
+                    "output": [
                         {
-                            "index": 0,
-                            "message": {"role": "assistant", "content": decoded},
-                            "logprobs": None,
-                            "finish_reason": "stop",
+                            "type": "message",
+                            "id": f"msg_{uuid.uuid4().hex}",
+                            "role": "assistant",
+                            "content": [
+                                {"type": "output_text", "text": decoded, "annotations": []}
+                            ],
+                            "status": "completed",
                         }
                     ],
+                    "status": "completed",
                     "usage": {
-                        "prompt_tokens": len(full_prompts_tokens[idx]),
-                        "completion_tokens": len(tokens),
-                        "total_tokens": len(full_prompts_tokens[idx]) + len(tokens),
+                        "input_tokens": len(chunk_tokens[local_idx]),
+                        "output_tokens": len(tokens),
+                        "total_tokens": len(chunk_tokens[local_idx]) + len(tokens),
                     },
                 }
                 record = {
@@ -352,17 +384,59 @@ def process_batch(model, tokenizer, batch_item: dict):
                     "response": {"status_code": 200, "request_id": f"req_{uuid.uuid4().hex}", "body": response_body},
                     "error": None,
                 }
+            elif "messages" in body or url in ("/v1/chat/completions", ""):
+                # Chat Completions output format (if it was a batch API request)
+                if "custom_id" in orig:
+                    model_id = body.get("model", MODEL_PATH)
+                    response_body = {
+                        "id": f"chatcmpl-{uuid.uuid4().hex}",
+                        "object": "chat.completion",
+                        "created": now,
+                        "model": model_id,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {"role": "assistant", "content": decoded},
+                                "logprobs": None,
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": len(chunk_tokens[local_idx]),
+                            "completion_tokens": len(tokens),
+                            "total_tokens": len(chunk_tokens[local_idx]) + len(tokens),
+                        },
+                    }
+                    record = {
+                        "id": f"batch_req_{uuid.uuid4().hex}",
+                        "custom_id": custom_id,
+                        "response": {"status_code": 200, "request_id": f"req_{uuid.uuid4().hex}", "body": response_body},
+                        "error": None,
+                    }
+                else:
+                    # Legacy format — keep backward compatible
+                    record = dict(orig)
+                    record["result"] = decoded
             else:
-                # Legacy format — keep backward compatible
+                # Legacy format
                 record = dict(orig)
                 record["result"] = decoded
-        else:
-            # Legacy format
-            record = dict(orig)
-            record["result"] = decoded
-        results.append(record)
+            all_results.append(record)
 
-    _mark_batch_complete(batch_dir, results)
+        chunk_elapsed = time.perf_counter() - t_start
+        chunk_tps = chunk_tokens_generated / (chunk_elapsed / max(chunk_idx + 1, 1))
+        print(f"    Chunk {chunk_idx + 1} done: {chunk_size} prompts, "
+              f"{chunk_tokens_generated} tokens | running total: {total_tokens} tokens, "
+              f"{chunk_elapsed:.2f}s elapsed")
+
+    t_elapsed = time.perf_counter() - t_start
+    tps = total_tokens / t_elapsed if t_elapsed > 0 else 0.0
+
+    print(f"  Batch {batch_dir.name}: {len(prompts_text)} prompts in {num_chunks} chunks, "
+          f"{total_sentences} sentences, {total_tokens} tokens, {t_elapsed:.2f}s, {tps:.1f} tok/s")
+
+    # Mark batch complete only after ALL chunks have been processed
+    _mark_batch_complete(batch_dir, all_results)
 
     return {'prompts': len(prompts_text), 'sentences': total_sentences, 'tokens': total_tokens, 'time': t_elapsed}
 
