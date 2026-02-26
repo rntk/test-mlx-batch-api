@@ -5,6 +5,7 @@ import time
 import json
 import argparse
 import re
+import uuid
 from pathlib import Path
 
 from mlx_lm import load
@@ -12,13 +13,15 @@ from mlx_lm.generate import BatchGenerator, wired_limit, generation_stream
 from mlx_lm.models import cache as cache_module
 from mlx_lm.models.cache import KVCache, save_prompt_cache, load_prompt_cache
 
+import batch_api
+
 MODEL_PATH = "/Users/rnt/dev/models/openai/gpt-oss-20b-mlx-Q8"
 DEFAULT_BATCHES_DIR = "./batches"
 
 
-def get_cache_file_path(input_file: str) -> str:
-    """Return the prompt cache file path for a given input file."""
-    return str(Path(input_file).parent / "input.jsonl.promptcache")
+def get_cache_file_path(batch_dir: Path) -> str:
+    """Return the prompt cache file path stored inside the batch directory."""
+    return str(batch_dir / "input.jsonl.promptcache")
 
 
 def resolve_cache_file_path(base_cache_file: str) -> str:
@@ -105,36 +108,24 @@ def clone_cache(prompt_cache):
     return cloned
 
 
-def mark_batch_complete(batch_dir: Path, results: list):
-    """Write output.jsonl, create the .ready flag, and update metadata.json."""
-    output_file = batch_dir / "output.jsonl"
-    with open(output_file, 'w', encoding='utf-8') as f:
-        for result in results:
-            f.write(json.dumps(result, ensure_ascii=False) + "\n")
-
-    (batch_dir / "output.jsonl.ready").touch()
-
-    metadata_path = batch_dir / "metadata.json"
-    if metadata_path.exists():
-        with open(metadata_path, 'r') as f:
-            metadata = json.load(f)
-        metadata["status"] = "completed"
-        metadata["output_file"] = "output.jsonl"
-        metadata["completed_at"] = int(os.path.getctime(output_file))
-        metadata["request_counts"]["completed"] = len(results)
-        with open(metadata_path, 'w') as f:
-            json.dump(metadata, f, indent=2)
+def _mark_batch_complete(batch_dir: Path, results: list):
+    """Store results in the Files store and mark the batch as completed via batch_api."""
+    batch_api.mark_batch_complete(batch_dir.name, results)
 
 
 def process_batch(model, tokenizer, batch_item: dict):
     """Process a single batch directory (batch_api.py format)."""
     batch_dir = batch_item['batch_dir']
     input_file = batch_item['input_file_path']
-    ready_file = batch_dir / "output.jsonl.ready"
 
-    if ready_file.exists():
-        print(f"Skipping {batch_dir.name}: already completed")
-        return
+    # Guard: re-read metadata in case another process already completed it
+    metadata_path = batch_dir / "metadata.json"
+    if metadata_path.exists():
+        with open(metadata_path) as _f:
+            _meta = json.load(_f)
+        if _meta.get("status") not in {"in_progress", "validating", "processing"}:
+            print(f"Skipping {batch_dir.name}: status={_meta.get('status')}")
+            return
 
     # Read all lines from input file
     with open(input_file, 'r', encoding='utf-8') as f:
@@ -151,7 +142,42 @@ def process_batch(model, tokenizer, batch_item: dict):
     line_data = []
     for line in all_lines:
         data = json.loads(line)
-        prompt = data["prompt"]
+        url = data.get("url", "")
+        body = data.get("body", {})
+        # Support Responses API format: {"url": "/v1/responses", "body": {"input": ..., "instructions": ...}}
+        if url == "/v1/responses" or ("input" in body and "messages" not in body):
+            raw_input = body.get("input", "")
+            if isinstance(raw_input, str):
+                prompt = raw_input
+            elif isinstance(raw_input, list):
+                # Extract text from ResponseInputItem list
+                parts = []
+                for item in raw_input:
+                    if isinstance(item, str):
+                        parts.append(item)
+                    elif isinstance(item, dict):
+                        role = item.get("role", "")
+                        content = item.get("content", "")
+                        if isinstance(content, str):
+                            parts.append(content)
+                        elif isinstance(content, list):
+                            for c in content:
+                                if isinstance(c, dict) and c.get("type") == "input_text":
+                                    parts.append(c.get("text", ""))
+                                elif isinstance(c, str):
+                                    parts.append(c)
+                prompt = " ".join(parts)
+            else:
+                prompt = ""
+        # Support Chat Completions Batch API format: {"body": {"messages": [...]}}
+        elif "body" in data and "messages" in body:
+            user_content = next(
+                (m["content"] for m in reversed(body["messages"]) if m["role"] == "user"),
+                "",
+            )
+            prompt = user_content
+        else:
+            prompt = data.get("prompt", "")
         prompts_text.append(prompt)
         line_data.append(data)
 
@@ -163,15 +189,50 @@ def process_batch(model, tokenizer, batch_item: dict):
     
     # Tokenize all prompts
     full_prompts_tokens = []
-    for p in prompts_text:
-        messages = [{"role": "user", "content": p}]
+    for idx, p in enumerate(prompts_text):
+        orig = line_data[idx]
+        url = orig.get("url", "")
+        body = orig.get("body", {})
+        # Responses API format: build messages from input + optional instructions
+        if url == "/v1/responses" or ("input" in body and "messages" not in body):
+            raw_input = body.get("input", "")
+            instructions = body.get("instructions", None)
+            msgs = []
+            if instructions:
+                msgs.append({"role": "system", "content": instructions})
+            if isinstance(raw_input, list):
+                # ResponseInputItem list — may already be message-shaped
+                for item in raw_input:
+                    if isinstance(item, dict) and "role" in item:
+                        content = item.get("content", "")
+                        if isinstance(content, list):
+                            # Flatten content parts to a single string
+                            text_parts = []
+                            for c in content:
+                                if isinstance(c, dict):
+                                    text_parts.append(c.get("text", c.get("input_text", "")))
+                                elif isinstance(c, str):
+                                    text_parts.append(c)
+                            msgs.append({"role": item["role"], "content": " ".join(text_parts)})
+                        else:
+                            msgs.append({"role": item["role"], "content": content})
+                    else:
+                        # Plain string item — treat as user message
+                        msgs.append({"role": "user", "content": str(item)})
+            else:
+                msgs.append({"role": "user", "content": str(raw_input)})
+        # Chat Completions format
+        elif "messages" in body:
+            msgs = body["messages"]
+        else:
+            msgs = [{"role": "user", "content": p}]
         formatted = tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, tokenize=False
+            msgs, add_generation_prompt=True, tokenize=False
         )
         full_prompts_tokens.append(tokenizer.encode(formatted))
     
-    # Handle KV cache prefix optimization
-    base_cache_file = get_cache_file_path(str(input_file))
+    # Handle KV cache prefix optimization — cache is kept in the batch directory
+    base_cache_file = get_cache_file_path(batch_dir)
     cache_file = resolve_cache_file_path(base_cache_file)
     
     if os.path.exists(cache_file):
@@ -224,17 +285,94 @@ def process_batch(model, tokenizer, batch_item: dict):
     results = []
     for idx, (uid, tokens) in enumerate(results_dict.items()):
         decoded = tokenizer.decode(tokens)
-        record = dict(line_data[idx])  # copy original fields
-        record["result"] = decoded
+        orig = line_data[idx]
+        url = orig.get("url", "")
+        body = orig.get("body", {})
+        custom_id = orig.get("custom_id", str(idx))
+        now = int(time.time())
+
+        if url == "/v1/responses" or ("input" in body and "messages" not in body):
+            # Responses API output format
+            model_id = body.get("model", MODEL_PATH)
+            response_body = {
+                "id": f"resp_{uuid.uuid4().hex}",
+                "object": "response",
+                "created_at": now,
+                "model": model_id,
+                "output": [
+                    {
+                        "type": "message",
+                        "id": f"msg_{uuid.uuid4().hex}",
+                        "role": "assistant",
+                        "content": [
+                            {"type": "output_text", "text": decoded, "annotations": []}
+                        ],
+                        "status": "completed",
+                    }
+                ],
+                "status": "completed",
+                "usage": {
+                    "input_tokens": len(full_prompts_tokens[idx]),
+                    "output_tokens": len(tokens),
+                    "total_tokens": len(full_prompts_tokens[idx]) + len(tokens),
+                },
+            }
+            record = {
+                "id": f"batch_req_{uuid.uuid4().hex}",
+                "custom_id": custom_id,
+                "response": {"status_code": 200, "request_id": f"req_{uuid.uuid4().hex}", "body": response_body},
+                "error": None,
+            }
+        elif "messages" in body or url in ("/v1/chat/completions", ""):
+            # Chat Completions output format (if it was a batch API request)
+            if "custom_id" in orig:
+                model_id = body.get("model", MODEL_PATH)
+                response_body = {
+                    "id": f"chatcmpl-{uuid.uuid4().hex}",
+                    "object": "chat.completion",
+                    "created": now,
+                    "model": model_id,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": decoded},
+                            "logprobs": None,
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": len(full_prompts_tokens[idx]),
+                        "completion_tokens": len(tokens),
+                        "total_tokens": len(full_prompts_tokens[idx]) + len(tokens),
+                    },
+                }
+                record = {
+                    "id": f"batch_req_{uuid.uuid4().hex}",
+                    "custom_id": custom_id,
+                    "response": {"status_code": 200, "request_id": f"req_{uuid.uuid4().hex}", "body": response_body},
+                    "error": None,
+                }
+            else:
+                # Legacy format — keep backward compatible
+                record = dict(orig)
+                record["result"] = decoded
+        else:
+            # Legacy format
+            record = dict(orig)
+            record["result"] = decoded
         results.append(record)
 
-    mark_batch_complete(batch_dir, results)
+    _mark_batch_complete(batch_dir, results)
 
     return {'prompts': len(prompts_text), 'sentences': total_sentences, 'tokens': total_tokens, 'time': t_elapsed}
 
 
 def get_pending_batches(batches_dir: Path) -> list:
-    """Return batch subdirectories that are pending based on metadata status."""
+    """Return batch subdirectories that are pending based on metadata status.
+
+    Resolves the input file through the batch_api Files store (input_file_id),
+    with a fallback to a legacy input.jsonl inside the batch directory.
+    """
     pending = []
     if not batches_dir.is_dir():
         return pending
@@ -246,13 +384,31 @@ def get_pending_batches(batches_dir: Path) -> list:
             continue
         with open(metadata_path) as f:
             metadata = json.load(f)
-        if metadata.get("status") in ["in_progress", "validating", "processing"]:
+        if metadata.get("status") not in {"in_progress", "validating", "processing"}:
+            continue
+
+        # Resolve input file: new API uses input_file_id → Files store
+        input_file_id = metadata.get("input_file_id")
+        if input_file_id:
+            input_file_path = batch_api._file_content_path(input_file_id)
+            if not input_file_path.exists():
+                print(f"Warning: input file {input_file_id} not found for batch "
+                      f"{batch_dir.name} — skipping")
+                continue
+        else:
+            # Legacy fallback: input.jsonl lives directly in the batch directory
             input_file_name = metadata.get("input_file", "input.jsonl")
-            pending.append({
-                "metadata": metadata,
-                "batch_dir": batch_dir,
-                "input_file_path": batch_dir / input_file_name
-            })
+            input_file_path = batch_dir / input_file_name
+            if not input_file_path.exists():
+                print(f"Warning: input file {input_file_path} not found for batch "
+                      f"{batch_dir.name} — skipping")
+                continue
+
+        pending.append({
+            "metadata": metadata,
+            "batch_dir": batch_dir,
+            "input_file_path": input_file_path,
+        })
     return pending
 
 
@@ -273,13 +429,6 @@ def main():
         print(f"Error: {batches_dir} is not a directory")
         sys.exit(1)
 
-    pending = get_pending_batches(batches_dir)
-    if not pending:
-        print(f"No pending batches in {batches_dir}")
-        return
-
-    print(f"Found {len(pending)} pending batch(es) in {batches_dir}\n")
-
     # Load model once
     print("Loading model...")
     model, tokenizer = load(MODEL_PATH)
@@ -292,15 +441,25 @@ def main():
     total_tokens = 0
     total_time = 0.0
 
-    for item in pending:
-        batch_dir = item['batch_dir']
-        print(f"--- Processing batch {batch_dir.name} ---")
-        metrics = process_batch(model, tokenizer, item)
-        total_batches += 1
-        total_prompts += metrics['prompts']
-        total_sentences += metrics['sentences']
-        total_tokens += metrics['tokens']
-        total_time += metrics['time']
+    try:
+        while True:
+            pending = get_pending_batches(batches_dir)
+            if pending:
+                print(f"Found {len(pending)} pending batch(es) in {batches_dir}\n")
+                for item in pending:
+                    batch_dir = item['batch_dir']
+                    print(f"--- Processing batch {batch_dir.name} ---")
+                    metrics = process_batch(model, tokenizer, item)
+                    total_batches += 1
+                    total_prompts += metrics['prompts']
+                    total_sentences += metrics['sentences']
+                    total_tokens += metrics['tokens']
+                    total_time += metrics['time']
+            else:
+                print(f"No pending batches in {batches_dir}. Checking again in 10 seconds...")
+                time.sleep(10)
+    except KeyboardInterrupt:
+        print("\nInterrupted by user. Exiting...")
 
     # Print overall metrics
     avg_tps = total_tokens / total_time if total_time > 0 else 0.0
@@ -311,8 +470,6 @@ def main():
     print(f"Total tokens generated: {total_tokens}")
     print(f"Total inference time: {total_time:.2f}s")
     print(f"Average tokens per second: {avg_tps:.1f} tok/s")
-
-    print("\nAll pending batches processed.")
 
 
 if __name__ == "__main__":

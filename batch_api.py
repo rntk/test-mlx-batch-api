@@ -1,395 +1,568 @@
 #!/usr/bin/env python3
 """
-Simple Batch API Server
+Batch API Server with Files API
 
-A pure Python HTTP server for batch file upload and download.
-- Upload batch files via POST /batches
-- Download results via GET /batches/{batch_id}/results
-- Results are only available if a .ready file exists
+Implements a subset of the OpenAI Files API and Batch API using only the
+Python standard library.
+
+Files API
+---------
+  POST   /files                   – Upload a file (multipart/form-data or raw body)
+  GET    /files                   – List files
+  GET    /files/{file_id}         – Retrieve file metadata
+  GET    /files/{file_id}/content – Download file content
+  DELETE /files/{file_id}         – Delete a file
+
+Batch API
+---------
+  POST   /batches                 – Create a batch (JSON body: input_file_id, endpoint, …)
+  GET    /batches                 – List all batches
+  GET    /batches/{batch_id}      – Get batch status
+  POST   /batches/{batch_id}/cancel – Cancel a batch
+  DELETE /batches/{batch_id}      – Delete a batch
+
+Typical workflow
+~~~~~~~~~~~~~~~~
+1.  Upload your .jsonl file:
+        POST /files  (multipart/form-data, purpose=batch)
+    → returns FileObject with an ``id`` such as ``file-<hex>``
+
+2.  Create a batch:
+        POST /batches
+        {"input_file_id": "file-<hex>", "endpoint": "/v1/chat/completions",
+         "completion_window": "24h"}
+    → returns Batch object with status ``in_progress``
+
+3.  Poll until complete:
+        GET /batches/{batch_id}
+    → status transitions: validating → in_progress → finalizing → completed
+
+4.  Download results:
+        GET /files/{output_file_id}/content
+    (output_file_id comes from the completed Batch object)
+
+5.  Optionally cancel:
+        POST /batches/{batch_id}/cancel
 """
 
+import email
 import json
 import os
+import shutil
+import time
 import uuid
-import hashlib
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from urllib.parse import urlparse
 
+# ---------------------------------------------------------------------------
 # Configuration
+# ---------------------------------------------------------------------------
+
 HOST = "0.0.0.0"
 PORT = 8788
 BATCHES_DIR = Path("./batches")
+FILES_DIR = Path("./files")
 
-# Ensure batches directory exists
 BATCHES_DIR.mkdir(parents=True, exist_ok=True)
+FILES_DIR.mkdir(parents=True, exist_ok=True)
 
+
+# ---------------------------------------------------------------------------
+# File-store helpers
+# ---------------------------------------------------------------------------
+
+def _file_meta_path(file_id: str) -> Path:
+    return FILES_DIR / f"{file_id}.meta.json"
+
+
+def _file_content_path(file_id: str) -> Path:
+    return FILES_DIR / file_id
+
+
+def _read_file_meta(file_id: str) -> dict | None:
+    path = _file_meta_path(file_id)
+    if not path.exists():
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def _list_all_file_metas() -> list[dict]:
+    files = []
+    for p in FILES_DIR.glob("*.meta.json"):
+        with open(p) as f:
+            files.append(json.load(f))
+    files.sort(key=lambda x: x.get("created_at", 0))
+    return files
+
+
+def _store_file(data: bytes, purpose: str, filename: str) -> dict:
+    """Write *data* into the file store and return its FileObject metadata."""
+    file_id = f"file-{uuid.uuid4().hex}"
+    _file_content_path(file_id).write_bytes(data)
+    meta = {
+        "id": file_id,
+        "object": "file",
+        "bytes": len(data),
+        "created_at": int(time.time()),
+        "filename": filename,
+        "purpose": purpose,
+        "status": "processed",
+    }
+    with open(_file_meta_path(file_id), "w") as f:
+        json.dump(meta, f, indent=2)
+    return meta
+
+
+# ---------------------------------------------------------------------------
+# Multipart form-data parser (stdlib only)
+# ---------------------------------------------------------------------------
+
+def _parse_multipart(headers, body: bytes) -> dict[str, bytes]:
+    """Return {field_name: raw_bytes} for each part in a multipart/form-data body."""
+    content_type = headers.get("Content-Type", "")
+    # Prepend a minimal header so email.message_from_bytes can parse it.
+    raw = f"Content-Type: {content_type}\r\n\r\n".encode() + body
+    msg = email.message_from_bytes(raw)
+    fields: dict[str, bytes] = {}
+    for part in msg.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+        cd = part.get("Content-Disposition", "")
+        if not cd:
+            continue
+        name: str | None = None
+        for token in cd.split(";"):
+            token = token.strip()
+            if token.startswith("name="):
+                name = token[5:].strip('"')
+                break
+        if name is None:
+            continue
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            payload = (part.get_payload() or "").encode()
+        fields[name] = payload
+    return fields
+
+
+# ---------------------------------------------------------------------------
+# HTTP handler
+# ---------------------------------------------------------------------------
 
 class BatchAPIHandler(BaseHTTPRequestHandler):
-    """HTTP request handler for Batch API."""
 
-    def log_message(self, format, *args):
-        """Override to use custom logging format."""
-        print(f"[{self.log_date_time_string()}] {args[0]}")
+    def log_message(self, format, *args):  # noqa: A002
+        print(f"[{self.log_date_time_string()}] {format % args}")
 
-    def _send_json_response(self, status_code: int, data: dict):
-        """Send a JSON response."""
-        self.send_response(status_code)
+    # ------------------------------------------------------------------
+    # Low-level response helpers
+    # ------------------------------------------------------------------
+
+    def _send_json(self, status: int, data):
+        body = json.dumps(data, indent=2).encode()
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(json.dumps(data).encode("utf-8"))
+        self.wfile.write(body)
 
-    def _send_file(self, file_path: Path):
-        """Send a file as response."""
-        self.send_response(200)
-        self.send_header("Content-Type", "application/jsonl")
-        self.send_header("Content-Length", str(file_path.stat().st_size))
+    def _send_bytes(self, status: int, content_type: str, data: bytes):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        with open(file_path, "rb") as f:
-            self.wfile.write(f.read())
+        self.wfile.write(data)
 
-    def _send_error(self, status_code: int, message: str):
-        """Send an error response."""
-        self._send_json_response(status_code, {"error": message})
+    def _error(self, status: int, message: str):
+        self._send_json(status, {"error": {"message": message, "type": "invalid_request_error"}})
 
-    def _get_content_length(self) -> int:
-        """Get Content-Length from headers."""
-        content_length = self.headers.get("Content-Length")
-        if content_length is None:
-            return 0
-        return int(content_length)
+    def _read_body(self) -> bytes:
+        length = int(self.headers.get("Content-Length", 0))
+        return self.rfile.read(length) if length else b""
+
+    # ------------------------------------------------------------------
+    # Routing
+    # ------------------------------------------------------------------
+
+    def _route(self) -> list[str]:
+        """Return path segments with empty strings removed."""
+        return [s for s in urlparse(self.path).path.split("/") if s]
 
     def do_GET(self):
-        """Handle GET requests."""
-        parsed_path = urlparse(self.path)
-        path = parsed_path.path
-
-        # GET /batches - List all batches
-        if path == "/batches":
-            self._list_batches()
-            return
-
-        # GET /batches/{batch_id} - Get batch status
-        if path.startswith("/batches/") and path.count("/") == 2:
-            batch_id = path.split("/")[2]
-            self._get_batch_status(batch_id)
-            return
-
-        # GET /batches/{batch_id}/results - Download results
-        if path.endswith("/results") and path.startswith("/batches/"):
-            parts = path.split("/")
-            if len(parts) == 4:
-                batch_id = parts[2]
-                self._download_results(batch_id)
-                return
-
-        self._send_error(404, "Not found")
+        parts = self._route()
+        match parts:
+            case ["files"]:
+                self._files_list()
+            case ["files", file_id]:
+                self._files_retrieve(file_id)
+            case ["files", file_id, "content"]:
+                self._files_content(file_id)
+            case ["batches"]:
+                self._batches_list()
+            case ["batches", batch_id]:
+                self._batches_retrieve(batch_id)
+            case _:
+                self._error(404, "Not found")
 
     def do_POST(self):
-        """Handle POST requests."""
-        parsed_path = urlparse(self.path)
-        path = parsed_path.path
-
-        # POST /batches - Upload batch file
-        if path == "/batches":
-            self._upload_batch()
-            return
-
-        # POST /batches/{batch_id}/cancel - Cancel a batch
-        if path.endswith("/cancel") and path.startswith("/batches/"):
-            parts = path.split("/")
-            if len(parts) == 4:
-                batch_id = parts[2]
-                self._cancel_batch(batch_id)
-                return
-
-        self._send_error(404, "Not found")
+        parts = self._route()
+        match parts:
+            case ["files"]:
+                self._files_create()
+            case ["batches"]:
+                self._batches_create()
+            case ["batches", batch_id, "cancel"]:
+                self._batches_cancel(batch_id)
+            case _:
+                self._error(404, "Not found")
 
     def do_DELETE(self):
-        """Handle DELETE requests."""
-        parsed_path = urlparse(self.path)
-        path = parsed_path.path
+        parts = self._route()
+        match parts:
+            case ["files", file_id]:
+                self._files_delete(file_id)
+            case ["batches", batch_id]:
+                self._batches_delete(batch_id)
+            case _:
+                self._error(404, "Not found")
 
-        # DELETE /batches/{batch_id} - Delete a batch
-        if path.startswith("/batches/") and path.count("/") == 2:
-            batch_id = path.split("/")[2]
-            self._delete_batch(batch_id)
+    # ==================================================================
+    # Files API
+    # ==================================================================
+
+    def _files_create(self):
+        """POST /files — upload a file."""
+        body = self._read_body()
+        ct = self.headers.get("Content-Type", "")
+
+        if "multipart/form-data" in ct:
+            fields = _parse_multipart(self.headers, body)
+            file_bytes: bytes = fields.get("file", b"")
+            purpose: str = (fields.get("purpose") or b"batch").decode().strip()
+            filename: str = "upload.jsonl"
+        else:
+            # Fallback: treat the raw body as the file content.
+            file_bytes = body
+            purpose = "batch"
+            filename = "upload.jsonl"
+
+        if not file_bytes:
+            self._error(400, "No file content provided")
             return
 
-        self._send_error(404, "Not found")
+        meta = _store_file(file_bytes, purpose, filename)
+        self._send_json(200, meta)
 
-    def _upload_batch(self):
-        """Handle batch file upload."""
-        content_length = self._get_content_length()
-        if content_length == 0:
-            self._send_error(400, "No file content provided")
+    def _files_list(self):
+        """GET /files — list all files."""
+        files = _list_all_file_metas()
+        self._send_json(200, {
+            "object": "list",
+            "data": files,
+            "first_id": files[0]["id"] if files else None,
+            "last_id": files[-1]["id"] if files else None,
+            "has_more": False,
+        })
+
+    def _files_retrieve(self, file_id: str):
+        """GET /files/{file_id} — return file metadata."""
+        meta = _read_file_meta(file_id)
+        if meta is None:
+            self._error(404, f"No such file: {file_id}")
+            return
+        self._send_json(200, meta)
+
+    def _files_content(self, file_id: str):
+        """GET /files/{file_id}/content — return raw file bytes."""
+        meta = _read_file_meta(file_id)
+        if meta is None:
+            self._error(404, f"No such file: {file_id}")
+            return
+        content_path = _file_content_path(file_id)
+        if not content_path.exists():
+            self._error(404, f"Content for file {file_id} not found")
+            return
+        self._send_bytes(200, "application/jsonl", content_path.read_bytes())
+
+    def _files_delete(self, file_id: str):
+        """DELETE /files/{file_id} — delete a file."""
+        if _read_file_meta(file_id) is None:
+            self._error(404, f"No such file: {file_id}")
+            return
+        _file_content_path(file_id).unlink(missing_ok=True)
+        _file_meta_path(file_id).unlink(missing_ok=True)
+        self._send_json(200, {"id": file_id, "object": "file", "deleted": True})
+
+    # ==================================================================
+    # Batches API
+    # ==================================================================
+
+    def _batches_create(self):
+        """POST /batches — create a batch job referencing an uploaded file."""
+        body = self._read_body()
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            self._error(400, "Request body must be valid JSON")
             return
 
-        # Check content type
-        content_type = self.headers.get("Content-Type", "")
-        if "jsonl" not in content_type and "application/octet-stream" not in content_type:
-            # Accept various content types for flexibility
-            pass
+        input_file_id: str | None = data.get("input_file_id")
+        endpoint: str = data.get("endpoint", "/v1/chat/completions")
+        completion_window: str = data.get("completion_window", "24h")
+        metadata = data.get("metadata")
 
-        # Generate batch ID
+        if not input_file_id:
+            self._error(400, "input_file_id is required")
+            return
+
+        file_meta = _read_file_meta(input_file_id)
+        if file_meta is None:
+            self._error(404, f"No such file: {input_file_id}")
+            return
+
+        # Count non-empty lines in the input file.
+        content_path = _file_content_path(input_file_id)
+        total_requests = 0
+        if content_path.exists():
+            total_requests = sum(
+                1 for line in content_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            )
+
         batch_id = f"batch_{uuid.uuid4().hex}"
+        now = int(time.time())
         batch_dir = BATCHES_DIR / batch_id
         batch_dir.mkdir(parents=True, exist_ok=True)
 
-        # Generate random input file name
-        input_file_name = f"{uuid.uuid4().hex}.jsonl"
-        input_file_path = batch_dir / input_file_name
-        content = self.rfile.read(content_length)
-
-        # Validate JSONL format (each line should be valid JSON)
-        try:
-            lines = content.decode("utf-8").strip().split("\n")
-            for line in lines:
-                if line.strip():
-                    json.loads(line)
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            # Clean up on validation failure
-            input_file_path.unlink(missing_ok=True)
-            batch_dir.rmdir()
-            self._send_error(400, f"Invalid JSONL format: {str(e)}")
-            return
-
-        with open(input_file_path, "wb") as f:
-            f.write(content)
-
-        # Create batch metadata
-        metadata = {
+        batch_obj = {
             "id": batch_id,
-            "status": "validating",
-            "input_file": input_file_name,
-            "output_file": None,
-            "error_file": None,
-            "created_at": int(os.path.getctime(input_file_path)),
+            "object": "batch",
+            "endpoint": endpoint,
+            "errors": None,
+            "input_file_id": input_file_id,
+            "completion_window": completion_window,
+            "status": "in_progress",
+            "output_file_id": None,
+            "error_file_id": None,
+            "created_at": now,
+            "in_progress_at": now,
+            "expires_at": now + 86400,
+            "finalizing_at": None,
+            "completed_at": None,
+            "failed_at": None,
+            "expired_at": None,
+            "cancelling_at": None,
+            "cancelled_at": None,
             "request_counts": {
-                "total": len(lines),
+                "total": total_requests,
                 "completed": 0,
-                "failed": 0
-            }
+                "failed": 0,
+            },
+            "metadata": metadata,
         }
 
-        # Save metadata
-        metadata_path = batch_dir / "metadata.json"
-        with open(metadata_path, "w") as f:
-            json.dump(metadata, f, indent=2)
+        with open(batch_dir / "metadata.json", "w") as f:
+            json.dump(batch_obj, f, indent=2)
 
-        # Update status to in_progress (simulating validation)
-        metadata["status"] = "in_progress"
-        with open(metadata_path, "w") as f:
-            json.dump(metadata, f, indent=2)
+        self._send_json(200, batch_obj)
 
-        self._send_json_response(200, metadata)
-
-    def _list_batches(self):
-        """List all batches."""
+    def _batches_list(self):
+        """GET /batches — list all batches."""
         batches = []
         for batch_dir in BATCHES_DIR.iterdir():
-            if batch_dir.is_dir():
-                metadata_path = batch_dir / "metadata.json"
-                if metadata_path.exists():
-                    with open(metadata_path, "r") as f:
-                        metadata = json.load(f)
-                        batches.append(metadata)
+            if not batch_dir.is_dir():
+                continue
+            meta_path = batch_dir / "metadata.json"
+            if meta_path.exists():
+                with open(meta_path) as f:
+                    batches.append(json.load(f))
+        batches.sort(key=lambda x: x.get("created_at", 0))
+        self._send_json(200, {
+            "object": "list",
+            "data": batches,
+            "first_id": batches[0]["id"] if batches else None,
+            "last_id": batches[-1]["id"] if batches else None,
+            "has_more": False,
+        })
 
-        self._send_json_response(200, {"data": batches, "object": "list"})
-
-    def _get_batch_status(self, batch_id: str):
-        """Get batch status."""
-        batch_dir = BATCHES_DIR / batch_id
-        metadata_path = batch_dir / "metadata.json"
-
-        if not metadata_path.exists():
-            self._send_error(404, f"Batch '{batch_id}' not found")
+    def _batches_retrieve(self, batch_id: str):
+        """GET /batches/{batch_id} — return batch status."""
+        meta_path = BATCHES_DIR / batch_id / "metadata.json"
+        if not meta_path.exists():
+            self._error(404, f"No such batch: {batch_id}")
             return
+        with open(meta_path) as f:
+            self._send_json(200, json.load(f))
 
-        with open(metadata_path, "r") as f:
-            metadata = json.load(f)
+    def _batches_cancel(self, batch_id: str):
+        """POST /batches/{batch_id}/cancel — cancel an in-progress batch."""
+        meta_path = BATCHES_DIR / batch_id / "metadata.json"
+        if not meta_path.exists():
+            self._error(404, f"No such batch: {batch_id}")
+            return
+        with open(meta_path) as f:
+            batch = json.load(f)
+        terminal = {"completed", "cancelled", "expired", "failed"}
+        if batch["status"] in terminal:
+            self._error(400, f"Cannot cancel batch with status '{batch['status']}'")
+            return
+        now = int(time.time())
+        batch["status"] = "cancelling"
+        batch["cancelling_at"] = now
+        with open(meta_path, "w") as f:
+            json.dump(batch, f, indent=2)
+        self._send_json(200, batch)
 
-        self._send_json_response(200, metadata)
-
-    def _download_results(self, batch_id: str):
-        """Download batch results."""
+    def _batches_delete(self, batch_id: str):
+        """DELETE /batches/{batch_id} — permanently remove a batch."""
         batch_dir = BATCHES_DIR / batch_id
-
         if not batch_dir.exists():
-            self._send_error(404, f"Batch '{batch_id}' not found")
+            self._error(404, f"No such batch: {batch_id}")
             return
-
-        # Load metadata
-        metadata_path = batch_dir / "metadata.json"
-        if not metadata_path.exists():
-            self._send_error(404, f"Batch '{batch_id}' metadata not found")
-            return
-
-        with open(metadata_path, "r") as f:
-            metadata = json.load(f)
-
-        output_file_name = metadata.get("output_file")
-        if not output_file_name:
-            self._send_error(500, "Output file not specified in metadata")
-            return
-
-        # Check if results are ready (.ready file exists)
-        ready_file = batch_dir / f"{output_file_name}.ready"
-        output_file = batch_dir / output_file_name
-
-        if not ready_file.exists():
-            self._send_json_response(200, {
-                "status": "not_ready",
-                "message": "Results are not ready yet. Batch is still processing."
-            })
-            return
-
-        if not output_file.exists():
-            self._send_error(500, "Ready flag exists but output file not found")
-            return
-
-        self._send_file(output_file)
-
-    def _cancel_batch(self, batch_id: str):
-        """Cancel a batch."""
-        batch_dir = BATCHES_DIR / batch_id
-        metadata_path = batch_dir / "metadata.json"
-
-        if not metadata_path.exists():
-            self._send_error(404, f"Batch '{batch_id}' not found")
-            return
-
-        with open(metadata_path, "r") as f:
-            metadata = json.load(f)
-
-        if metadata["status"] in ["completed", "cancelled", "expired", "failed"]:
-            self._send_error(400, f"Cannot cancel batch with status '{metadata['status']}'")
-            return
-
-        metadata["status"] = "cancelled"
-        with open(metadata_path, "w") as f:
-            json.dump(metadata, f, indent=2)
-
-        self._send_json_response(200, metadata)
-
-    def _delete_batch(self, batch_id: str):
-        """Delete a batch."""
-        batch_dir = BATCHES_DIR / batch_id
-
-        if not batch_dir.exists():
-            self._send_error(404, f"Batch '{batch_id}' not found")
-            return
-
-        import shutil
         shutil.rmtree(batch_dir)
+        self._send_json(200, {"id": batch_id, "object": "batch", "deleted": True})
 
-        self._send_json_response(200, {"deleted": True, "id": batch_id})
 
+# ---------------------------------------------------------------------------
+# Worker helpers (called by background processors, not by the HTTP layer)
+# ---------------------------------------------------------------------------
 
-def mark_batch_ready(batch_id: str, results: list):
+def get_pending_batches() -> list[dict]:
+    """Return all batches whose status is ``in_progress``, ``validating``, or
+    ``processing``.
+
+    Each entry is a dict with:
+
+    * ``metadata``       – the full Batch object dict
+    * ``batch_dir``      – :class:`~pathlib.Path` to the batch directory
+    * ``input_file_path``– :class:`~pathlib.Path` to the raw input JSONL, or
+                           ``None`` if the file is missing
     """
-    Helper function to mark a batch as complete with results.
-    This would typically be called by a background worker.
+    pending = []
+    for batch_dir in BATCHES_DIR.iterdir():
+        if not batch_dir.is_dir():
+            continue
+        meta_path = batch_dir / "metadata.json"
+        if not meta_path.exists():
+            continue
+        with open(meta_path) as f:
+            metadata = json.load(f)
+        if metadata.get("status") not in {"in_progress", "validating", "processing"}:
+            continue
+        input_file_id: str | None = metadata.get("input_file_id")
+        input_file_path: Path | None = None
+        if input_file_id:
+            p = _file_content_path(input_file_id)
+            input_file_path = p if p.exists() else None
+        pending.append({
+            "metadata": metadata,
+            "batch_dir": batch_dir,
+            "input_file_path": input_file_path,
+        })
+    return pending
+
+
+def get_batch_input_file(batch_id: str) -> Path | None:
+    """Return the :class:`~pathlib.Path` to the input JSONL for *batch_id*,
+    or ``None`` if not found."""
+    meta_path = BATCHES_DIR / batch_id / "metadata.json"
+    if not meta_path.exists():
+        return None
+    with open(meta_path) as f:
+        metadata = json.load(f)
+    input_file_id: str | None = metadata.get("input_file_id")
+    if not input_file_id:
+        return None
+    p = _file_content_path(input_file_id)
+    return p if p.exists() else None
+
+
+def mark_batch_complete(
+    batch_id: str,
+    results: list,
+    errors: list | None = None,
+) -> None:
+    """Save *results* (and optionally *errors*) as output files in the Files
+    store, then mark the batch as ``completed``.
+
+    Each element of *results* / *errors* is serialised as one JSONL line.
+    The ``output_file_id`` (and ``error_file_id``) fields on the Batch object
+    are populated so callers can retrieve them via
+    ``GET /files/{output_file_id}/content``.
     """
     batch_dir = BATCHES_DIR / batch_id
     if not batch_dir.exists():
         raise ValueError(f"Batch '{batch_id}' not found")
 
-    # Generate random output file name
-    output_file_name = f"{uuid.uuid4().hex}.jsonl"
-    output_file = batch_dir / output_file_name
-    with open(output_file, "w") as f:
-        for result in results:
-            f.write(json.dumps(result) + "\n")
+    meta_path = batch_dir / "metadata.json"
+    with open(meta_path) as f:
+        batch = json.load(f)
 
-    # Create .ready flag file
-    ready_file = batch_dir / f"{output_file_name}.ready"
-    ready_file.touch()
+    now = int(time.time())
 
-    # Update metadata
-    metadata_path = batch_dir / "metadata.json"
-    with open(metadata_path, "r") as f:
-        metadata = json.load(f)
+    if results:
+        out_meta = _store_file(
+            data=("\n".join(json.dumps(r) for r in results) + "\n").encode(),
+            purpose="batch_output",
+            filename=f"{batch_id}_output.jsonl",
+        )
+        batch["output_file_id"] = out_meta["id"]
+        batch["request_counts"]["completed"] = len(results)
 
-    metadata["status"] = "completed"
-    metadata["output_file"] = output_file_name
-    metadata["completed_at"] = int(os.path.getctime(output_file))
-    metadata["request_counts"]["completed"] = len(results)
+    if errors:
+        err_meta = _store_file(
+            data=("\n".join(json.dumps(e) for e in errors) + "\n").encode(),
+            purpose="batch_output",
+            filename=f"{batch_id}_errors.jsonl",
+        )
+        batch["error_file_id"] = err_meta["id"]
+        batch["request_counts"]["failed"] = len(errors)
 
-    with open(metadata_path, "w") as f:
-        json.dump(metadata, f, indent=2)
+    batch["status"] = "completed"
+    batch["finalizing_at"] = now
+    batch["completed_at"] = now
+    batch["request_counts"]["total"] = (
+        batch["request_counts"]["completed"] + batch["request_counts"]["failed"]
+    )
 
-
-def get_pending_batches():
-    """
-    Get list of batches that are not yet completed.
-    Returns list of batch metadata for batches with status 'in_progress' or 'validating'.
-    """
-    pending = []
-    for batch_dir in BATCHES_DIR.iterdir():
-        if batch_dir.is_dir():
-            metadata_path = batch_dir / "metadata.json"
-            if metadata_path.exists():
-                with open(metadata_path, "r") as f:
-                    metadata = json.load(f)
-                    if metadata.get("status") in ["in_progress", "validating", "processing"]:
-                        input_file_name = metadata.get("input_file", "input.jsonl")
-                        pending.append({
-                            "metadata": metadata,
-                            "batch_dir": batch_dir,
-                            "input_file_path": batch_dir / input_file_name
-                        })
-    return pending
+    with open(meta_path, "w") as f:
+        json.dump(batch, f, indent=2)
 
 
-def get_batch_input_file(batch_id: str) -> Path | None:
-    """
-    Get the input file path for a batch.
-    Returns None if batch doesn't exist or input file not found.
-    """
-    batch_dir = BATCHES_DIR / batch_id
-    if not batch_dir.exists():
-        return None
-    
-    metadata_path = batch_dir / "metadata.json"
-    if not metadata_path.exists():
-        return None
-
-    with open(metadata_path, "r") as f:
-        metadata = json.load(f)
-
-    input_file_name = metadata.get("input_file")
-    if not input_file_name:
-        return None
-
-    input_file = batch_dir / input_file_name
-    if input_file.exists():
-        return input_file
-    return None
+# Backward-compatible alias
+def mark_batch_ready(batch_id: str, results: list) -> None:
+    """Alias for :func:`mark_batch_complete` (backward compatibility)."""
+    mark_batch_complete(batch_id, results)
 
 
-def mark_batch_complete(batch_id: str, results: list):
-    """
-    Mark a batch as complete with results.
-    This is the main entry point for workers to save results and mark batch as ready.
-    """
-    mark_batch_ready(batch_id, results)
-
+# ---------------------------------------------------------------------------
+# Server entry point
+# ---------------------------------------------------------------------------
 
 def run_server(host: str = HOST, port: int = PORT):
     """Start the HTTP server."""
-    server_address = (host, port)
-    httpd = HTTPServer(server_address, BatchAPIHandler)
-    print(f"Batch API Server running at http://{host}:{port}")
-    print(f"Batch files stored in: {BATCHES_DIR.absolute()}")
-    print("\nEndpoints:")
-    print(f"  POST   /batches              - Upload batch file")
-    print(f"  GET    /batches              - List all batches")
-    print(f"  GET    /batches/{{id}}         - Get batch status")
-    print(f"  GET    /batches/{{id}}/results - Download results")
-    print(f"  POST   /batches/{{id}}/cancel  - Cancel batch")
-    print(f"  DELETE /batches/{{id}}         - Delete batch")
-    print("\nPress Ctrl+C to stop the server")
+    httpd = HTTPServer((host, port), BatchAPIHandler)
+    print(f"Batch API Server  http://{host}:{port}")
+    print(f"  Files store : {FILES_DIR.absolute()}")
+    print(f"  Batches dir : {BATCHES_DIR.absolute()}")
+    print()
+    print("Files API:")
+    print("  POST   /files                    Upload a file (multipart/form-data, purpose=batch)")
+    print("  GET    /files                    List files")
+    print("  GET    /files/{id}               Retrieve file metadata")
+    print("  GET    /files/{id}/content       Download file content")
+    print("  DELETE /files/{id}               Delete a file")
+    print()
+    print("Batch API:")
+    print("  POST   /batches                  Create a batch (JSON: input_file_id, endpoint, …)")
+    print("  GET    /batches                  List batches")
+    print("  GET    /batches/{id}             Get batch status")
+    print("  POST   /batches/{id}/cancel      Cancel a batch")
+    print("  DELETE /batches/{id}             Delete a batch")
+    print()
+    print("Press Ctrl+C to stop.")
     httpd.serve_forever()
 
 
