@@ -13,7 +13,7 @@ import os
 import uuid
 import hashlib
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 from pathlib import Path
 
 # Configuration
@@ -132,12 +132,13 @@ class BatchAPIHandler(BaseHTTPRequestHandler):
             pass
 
         # Generate batch ID
-        batch_id = f"batch_{uuid.uuid4().hex[:12]}"
+        batch_id = f"batch_{uuid.uuid4().hex}"
         batch_dir = BATCHES_DIR / batch_id
         batch_dir.mkdir(parents=True, exist_ok=True)
 
-        # Read and save input file
-        input_file_path = batch_dir / "input.jsonl"
+        # Generate random input file name
+        input_file_name = f"{uuid.uuid4().hex}.jsonl"
+        input_file_path = batch_dir / input_file_name
         content = self.rfile.read(content_length)
 
         # Validate JSONL format (each line should be valid JSON)
@@ -160,7 +161,7 @@ class BatchAPIHandler(BaseHTTPRequestHandler):
         metadata = {
             "id": batch_id,
             "status": "validating",
-            "input_file": "input.jsonl",
+            "input_file": input_file_name,
             "output_file": None,
             "error_file": None,
             "created_at": int(os.path.getctime(input_file_path)),
@@ -218,9 +219,23 @@ class BatchAPIHandler(BaseHTTPRequestHandler):
             self._send_error(404, f"Batch '{batch_id}' not found")
             return
 
+        # Load metadata
+        metadata_path = batch_dir / "metadata.json"
+        if not metadata_path.exists():
+            self._send_error(404, f"Batch '{batch_id}' metadata not found")
+            return
+
+        with open(metadata_path, "r") as f:
+            metadata = json.load(f)
+
+        output_file_name = metadata.get("output_file")
+        if not output_file_name:
+            self._send_error(500, "Output file not specified in metadata")
+            return
+
         # Check if results are ready (.ready file exists)
-        ready_file = batch_dir / "output.jsonl.ready"
-        output_file = batch_dir / "output.jsonl"
+        ready_file = batch_dir / f"{output_file_name}.ready"
+        output_file = batch_dir / output_file_name
 
         if not ready_file.exists():
             self._send_json_response(200, {
@@ -280,14 +295,15 @@ def mark_batch_ready(batch_id: str, results: list):
     if not batch_dir.exists():
         raise ValueError(f"Batch '{batch_id}' not found")
 
-    # Write output file
-    output_file = batch_dir / "output.jsonl"
+    # Generate random output file name
+    output_file_name = f"{uuid.uuid4().hex}.jsonl"
+    output_file = batch_dir / output_file_name
     with open(output_file, "w") as f:
         for result in results:
             f.write(json.dumps(result) + "\n")
 
     # Create .ready flag file
-    ready_file = batch_dir / "output.jsonl.ready"
+    ready_file = batch_dir / f"{output_file_name}.ready"
     ready_file.touch()
 
     # Update metadata
@@ -296,7 +312,7 @@ def mark_batch_ready(batch_id: str, results: list):
         metadata = json.load(f)
 
     metadata["status"] = "completed"
-    metadata["output_file"] = "output.jsonl"
+    metadata["output_file"] = output_file_name
     metadata["completed_at"] = int(os.path.getctime(output_file))
     metadata["request_counts"]["completed"] = len(results)
 
@@ -317,10 +333,11 @@ def get_pending_batches():
                 with open(metadata_path, "r") as f:
                     metadata = json.load(f)
                     if metadata.get("status") in ["in_progress", "validating", "processing"]:
+                        input_file_name = metadata.get("input_file", "input.jsonl")
                         pending.append({
                             "metadata": metadata,
                             "batch_dir": batch_dir,
-                            "input_file_path": batch_dir / "input.jsonl"
+                            "input_file_path": batch_dir / input_file_name
                         })
     return pending
 
@@ -334,7 +351,18 @@ def get_batch_input_file(batch_id: str) -> Path | None:
     if not batch_dir.exists():
         return None
     
-    input_file = batch_dir / "input.jsonl"
+    metadata_path = batch_dir / "metadata.json"
+    if not metadata_path.exists():
+        return None
+
+    with open(metadata_path, "r") as f:
+        metadata = json.load(f)
+
+    input_file_name = metadata.get("input_file")
+    if not input_file_name:
+        return None
+
+    input_file = batch_dir / input_file_name
     if input_file.exists():
         return input_file
     return None

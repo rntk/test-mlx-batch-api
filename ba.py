@@ -1,42 +1,24 @@
-from mlx_lm import load
-from mlx_lm.generate import BatchGenerator, wired_limit, generation_stream
-from mlx_lm.models import cache as cache_module
-from mlx_lm.models.cache import KVCache, save_prompt_cache, load_prompt_cache
 import mlx.core as mx
 import sys
 import os
 import time
 import json
 import argparse
+import re
 from pathlib import Path
-sys.path.insert(0, '/Users/rnt/dev/python/mlx/txt-splitt/src')
 
-from txt_splitt import BatchPipeline, RegexSentenceSplitter, BracketMarker, StrictGapHandler, SizeBasedChunker
-from txt_splitt.types import SentenceGroup, SentenceRange
-from txt_splitt.llm import _build_topic_ranges_prompt
-
-# Total character budget for the full prompt sent to the model.
-# The chunker receives content_max_chars = PROMPT_MAX_CHARS - instruction_overhead
-# so that tagged_text + instructions always fits within PROMPT_MAX_CHARS.
-PROMPT_MAX_CHARS = 17_000
-_INSTRUCTION_OVERHEAD = len(_build_topic_ranges_prompt(""))  # ~5164 chars
-_CONTENT_MAX_CHARS = PROMPT_MAX_CHARS - _INSTRUCTION_OVERHEAD
+from mlx_lm import load
+from mlx_lm.generate import BatchGenerator, wired_limit, generation_stream
+from mlx_lm.models import cache as cache_module
+from mlx_lm.models.cache import KVCache, save_prompt_cache, load_prompt_cache
 
 MODEL_PATH = "/Users/rnt/dev/models/openai/gpt-oss-20b-mlx-Q8"
-
-# Batch API configuration
-BATCHES_DIR = Path("./batches")
-
-
-class DummyResponseParser:
-    """Dummy parser for benchmarking - just returns empty groups."""
-    def parse(self, response: str, sentence_count: int):
-        return []
+DEFAULT_BATCHES_DIR = "./batches"
 
 
 def get_cache_file_path(input_file: str) -> str:
     """Return the prompt cache file path for a given input file."""
-    return input_file + ".promptcache"
+    return str(Path(input_file).parent / "input.jsonl.promptcache")
 
 
 def resolve_cache_file_path(base_cache_file: str) -> str:
@@ -123,61 +105,63 @@ def clone_cache(prompt_cache):
     return cloned
 
 
-def mark_batch_ready(batch_id: str, results: list, metadata: dict):
-    """
-    Mark a batch as complete with results.
-    Writes output.jsonl and creates .ready flag file.
-    """
-    batch_dir = BATCHES_DIR / batch_id
-    if not batch_dir.exists():
-        batch_dir.mkdir(parents=True, exist_ok=True)
-
-    # Write output file
+def mark_batch_complete(batch_dir: Path, results: list):
+    """Write output.jsonl, create the .ready flag, and update metadata.json."""
     output_file = batch_dir / "output.jsonl"
-    with open(output_file, "w", encoding="utf-8") as f:
+    with open(output_file, 'w', encoding='utf-8') as f:
         for result in results:
-            f.write(json.dumps(result) + "\n")
+            f.write(json.dumps(result, ensure_ascii=False) + "\n")
 
-    # Create .ready flag file
-    ready_file = batch_dir / "output.jsonl.ready"
-    ready_file.touch()
+    (batch_dir / "output.jsonl.ready").touch()
 
-    # Update metadata
     metadata_path = batch_dir / "metadata.json"
-    metadata["status"] = "completed"
-    metadata["output_file"] = "output.jsonl"
-    metadata["completed_at"] = int(os.path.getctime(output_file))
-    metadata["request_counts"]["completed"] = len(results)
+    if metadata_path.exists():
+        with open(metadata_path, 'r') as f:
+            metadata = json.load(f)
+        metadata["status"] = "completed"
+        metadata["output_file"] = "output.jsonl"
+        metadata["completed_at"] = int(os.path.getctime(output_file))
+        metadata["request_counts"]["completed"] = len(results)
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
 
-    with open(metadata_path, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, indent=2)
 
-    print(f"Batch {batch_id} marked as ready with {len(results)} results")
+def process_batch(model, tokenizer, batch_item: dict):
+    """Process a single batch directory (batch_api.py format)."""
+    batch_dir = batch_item['batch_dir']
+    input_file = batch_item['input_file_path']
+    ready_file = batch_dir / "output.jsonl.ready"
 
+    if ready_file.exists():
+        print(f"Skipping {batch_dir.name}: already completed")
+        return
 
-def process_batch(model, tokenizer, text_content: str, batch_id: str, chunk_index: int):
-    """Process a single batch of text and return results."""
-    # Initialize BatchPipeline with components
-    pipeline = BatchPipeline(
-        splitter=RegexSentenceSplitter(),
-        marker=BracketMarker(),
-        parser=DummyResponseParser(),
-        gap_handler=StrictGapHandler(),
-        chunker=SizeBasedChunker(max_chars=_CONTENT_MAX_CHARS),
-    )
+    # Read all lines from input file
+    with open(input_file, 'r', encoding='utf-8') as f:
+        all_lines = [l for l in f.readlines() if l.strip()]
 
-    # Prepare document - splits text, marks sentences, chunks
-    prepared = pipeline.prepare(text_content)
+    if not all_lines:
+        print(f"No lines to process in {batch_dir.name}")
+        return
 
-    # Build full prompts: instructions + tagged content
+    print(f"Processing {len(all_lines)} lines from batch {batch_dir.name}")
+    
+    # Build prompts — each line is a JSON object with a "prompt" key
     prompts_text = []
-    for chunk in prepared.chunks:
-        prompts_text.append(_build_topic_ranges_prompt(chunk.tagged_text))
+    line_data = []
+    for line in all_lines:
+        data = json.loads(line)
+        prompt = data["prompt"]
+        prompts_text.append(prompt)
+        line_data.append(data)
 
     if not prompts_text:
-        return []
-
-    # Tokenize all prompts fully (with chat template)
+        print(f"No valid prompts in batch {batch_dir.name}")
+        return {'prompts': 0, 'sentences': 0, 'tokens': 0, 'time': 0.0}
+    
+    total_sentences = sum(len(re.findall(r'[.!?]+', p)) for p in prompts_text)
+    
+    # Tokenize all prompts
     full_prompts_tokens = []
     for p in prompts_text:
         messages = [{"role": "user", "content": p}]
@@ -185,11 +169,11 @@ def process_batch(model, tokenizer, text_content: str, batch_id: str, chunk_inde
             messages, add_generation_prompt=True, tokenize=False
         )
         full_prompts_tokens.append(tokenizer.encode(formatted))
-
-    # ── KV cache prefix optimization ──────────────────────────────────────
-    base_cache_file = f"batch_{batch_id}.promptcache"
+    
+    # Handle KV cache prefix optimization
+    base_cache_file = get_cache_file_path(str(input_file))
     cache_file = resolve_cache_file_path(base_cache_file)
-
+    
     if os.path.exists(cache_file):
         print(f"--- Loading Shared Prefix Cache from {cache_file} ---")
         prefix_cache, meta = load_prefix_cache(cache_file)
@@ -198,7 +182,7 @@ def process_batch(model, tokenizer, text_content: str, batch_id: str, chunk_inde
         prefix_cache, common_len = build_and_save_prefix_cache(
             model, tokenizer, full_prompts_tokens, base_cache_file
         )
-
+    
     if common_len > 0 and len(full_prompts_tokens) > 1:
         suffix_prompts = [toks[common_len:] for toks in full_prompts_tokens]
         mx.eval([c.state for c in prefix_cache])
@@ -206,8 +190,8 @@ def process_batch(model, tokenizer, text_content: str, batch_id: str, chunk_inde
     else:
         suffix_prompts = full_prompts_tokens
         caches = None
-
-    # ── Batch inference ───────────────────────────────────────────────────
+    
+    # Batch inference
     gen = BatchGenerator(
         model,
         stop_tokens=set(tokenizer.eos_token_ids),
@@ -215,137 +199,120 @@ def process_batch(model, tokenizer, text_content: str, batch_id: str, chunk_inde
         prefill_batch_size=12,
         prefill_step_size=4096,
     )
-
+    
     total_tokens = 0
     t_start = time.perf_counter()
-    results = []
+    results_dict = {}
+    
     with wired_limit(model, [generation_stream]):
         uids = gen.insert(suffix_prompts, max_tokens=24000, caches=caches)
         results_dict = {uid: [] for uid in uids}
-
+        
         while responses := gen.next():
             for r in responses:
                 if r.finish_reason is None:
                     results_dict[r.uid].append(r.token)
                     total_tokens += 1
-
+    
     t_elapsed = time.perf_counter() - t_start
     tps = total_tokens / t_elapsed if t_elapsed > 0 else 0.0
 
-    print(f"  Batch {batch_id} [{chunk_index}]: {total_tokens} tokens, "
-          f"{t_elapsed:.2f}s, {tps:.1f} tok/s")
+    print(f"  Batch {batch_dir.name}: {len(prompts_text)} prompts, {total_sentences} sentences, "
+          f"{total_tokens} tokens, {t_elapsed:.2f}s, {tps:.1f} tok/s")
 
-    # Convert results to JSONL format
-    for uid, tokens in results_dict.items():
+    # Build output records and mark batch complete
+    results = []
+    for idx, (uid, tokens) in enumerate(results_dict.items()):
         decoded = tokenizer.decode(tokens)
-        results.append({
-            "uid": uid,
-            "chunk_index": chunk_index,
-            "response": decoded,
-            "tokens": tokens
-        })
+        record = dict(line_data[idx])  # copy original fields
+        record["result"] = decoded
+        results.append(record)
 
-    return results
+    mark_batch_complete(batch_dir, results)
+
+    return {'prompts': len(prompts_text), 'sentences': total_sentences, 'tokens': total_tokens, 'time': t_elapsed}
+
+
+def get_pending_batches(batches_dir: Path) -> list:
+    """Return batch subdirectories that are pending based on metadata status."""
+    pending = []
+    if not batches_dir.is_dir():
+        return pending
+    for batch_dir in sorted(batches_dir.iterdir()):
+        if not batch_dir.is_dir():
+            continue
+        metadata_path = batch_dir / "metadata.json"
+        if not metadata_path.exists():
+            continue
+        with open(metadata_path) as f:
+            metadata = json.load(f)
+        if metadata.get("status") in ["in_progress", "validating", "processing"]:
+            input_file_name = metadata.get("input_file", "input.jsonl")
+            pending.append({
+                "metadata": metadata,
+                "batch_dir": batch_dir,
+                "input_file_path": batch_dir / input_file_name
+            })
+    return pending
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Batch process text files")
-    parser.add_argument("input_file", help="Input text file to process")
-    parser.add_argument("--batch-size", type=int, default=100,
-                        help="Number of lines per batch (default: 100)")
-    parser.add_argument("--batch-api", action="store_true",
-                        help="Use batch API mode - save results to batches directory")
-    parser.add_argument("--batch-id", type=str, default=None,
-                        help="Batch ID for batch API mode")
+    parser = argparse.ArgumentParser(
+        description="Process pending batch_api batches from the batches directory"
+    )
+    parser.add_argument(
+        "batches_dir",
+        nargs="?",
+        default=DEFAULT_BATCHES_DIR,
+        help=f"Path to the batches directory (default: {DEFAULT_BATCHES_DIR})",
+    )
     args = parser.parse_args()
 
-    input_file = args.input_file
-
-    if not os.path.exists(input_file):
-        print(f"Error: File '{input_file}' not found")
+    batches_dir = Path(args.batches_dir)
+    if not batches_dir.is_dir():
+        print(f"Error: {batches_dir} is not a directory")
         sys.exit(1)
 
-    # Read ALL lines from file
-    with open(input_file, 'r', encoding='utf-8') as f:
-        all_lines = f.readlines()
+    pending = get_pending_batches(batches_dir)
+    if not pending:
+        print(f"No pending batches in {batches_dir}")
+        return
 
-    if not all_lines:
-        print("No content to process")
-        sys.exit(1)
+    print(f"Found {len(pending)} pending batch(es) in {batches_dir}\n")
 
-    print(f"Loaded {len(all_lines)} lines from {input_file}")
-
-    # Load model once for all batches
-    print("\nLoading model...")
+    # Load model once
+    print("Loading model...")
     model, tokenizer = load(MODEL_PATH)
     print("Model loaded.\n")
 
-    batch_size = args.batch_size
-    all_results = []
+    # Initialize metrics
+    total_batches = 0
+    total_prompts = 0
+    total_sentences = 0
+    total_tokens = 0
+    total_time = 0.0
 
-    # Process file in batches
-    total_batches = (len(all_lines) + batch_size - 1) // batch_size
-    print(f"Processing {len(all_lines)} lines in {total_batches} batches (batch size: {batch_size})\n")
+    for item in pending:
+        batch_dir = item['batch_dir']
+        print(f"--- Processing batch {batch_dir.name} ---")
+        metrics = process_batch(model, tokenizer, item)
+        total_batches += 1
+        total_prompts += metrics['prompts']
+        total_sentences += metrics['sentences']
+        total_tokens += metrics['tokens']
+        total_time += metrics['time']
 
-    for batch_idx in range(total_batches):
-        start_idx = batch_idx * batch_size
-        end_idx = min(start_idx + batch_size, len(all_lines))
-        batch_lines = all_lines[start_idx:end_idx]
-        text_content = "".join(batch_lines)
+    # Print overall metrics
+    avg_tps = total_tokens / total_time if total_time > 0 else 0.0
+    print(f"\n--- Overall Metrics ---")
+    print(f"Total batches processed: {total_batches}")
+    print(f"Total prompts processed: {total_prompts}")
+    print(f"Total sentences processed: {total_sentences}")
+    print(f"Total tokens generated: {total_tokens}")
+    print(f"Total inference time: {total_time:.2f}s")
+    print(f"Average tokens per second: {avg_tps:.1f} tok/s")
 
-        batch_id = args.batch_id if args.batch_id else f"file_{os.path.basename(input_file)}_{batch_idx}"
-        chunk_index = batch_idx
-
-        print(f"\n--- Processing Batch {batch_idx + 1}/{total_batches} (lines {start_idx}-{end_idx}) ---")
-
-        if args.batch_api:
-            # Batch API mode: create batch directory and save results there
-            batch_dir = BATCHES_DIR / batch_id
-            batch_dir.mkdir(parents=True, exist_ok=True)
-
-            # Create initial metadata
-            metadata = {
-                "id": batch_id,
-                "status": "processing",
-                "input_file": input_file,
-                "chunk_index": chunk_index,
-                "lines_range": [start_idx, end_idx],
-                "created_at": int(time.time()),
-                "request_counts": {
-                    "total": len(batch_lines),
-                    "completed": 0,
-                    "failed": 0
-                }
-            }
-
-            # Save initial metadata
-            metadata_path = batch_dir / "metadata.json"
-            with open(metadata_path, "w", encoding="utf-8") as f:
-                json.dump(metadata, f, indent=2)
-
-            # Process the batch
-            results = process_batch(model, tokenizer, text_content, batch_id, chunk_index)
-
-            # Mark batch as ready
-            mark_batch_ready(batch_id, results, metadata)
-            all_results.extend(results)
-        else:
-            # Standard mode: process and collect results
-            results = process_batch(model, tokenizer, text_content, batch_id, chunk_index)
-            all_results.extend(results)
-
-    # In non-batch-API mode, save all results to a single file
-    if not args.batch_api:
-        output_file = "results.txt"
-        with open(output_file, 'w', encoding='utf-8') as f:
-            for result in all_results:
-                f.write(f"--- UID {result['uid']} (Chunk {result['chunk_index']}) ---\n")
-                f.write(f"{result['response']}\n\n")
-
-        print(f"\n--- All Results ---")
-        print(f"Total batches processed: {total_batches}")
-        print(f"Total results: {len(all_results)}")
-        print(f"Results saved to {output_file}")
+    print("\nAll pending batches processed.")
 
 
 if __name__ == "__main__":
