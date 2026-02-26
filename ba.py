@@ -10,6 +10,7 @@ from pathlib import Path
 
 from mlx_lm import load
 from mlx_lm.generate import BatchGenerator, wired_limit, generation_stream
+from mlx_lm.sample_utils import make_repetition_penalty
 from mlx_lm.models import cache as cache_module
 from mlx_lm.models.cache import KVCache, save_prompt_cache, load_prompt_cache
 
@@ -17,6 +18,7 @@ import batch_api
 
 MODEL_PATH = "/Users/rnt/dev/models/openai/gpt-oss-20b-mlx-Q8"
 DEFAULT_BATCHES_DIR = "./batches"
+REPETITION_PENALTY = 1.2
 
 # Dynamic chunk sizing — keep total prompt tokens per chunk within budget
 # to avoid GPU OOM.  b.py caps each prompt at ~12K chars (~3K tokens) so
@@ -141,6 +143,44 @@ def clone_cache(prompt_cache):
     return cloned
 
 
+def get_partial_results_path(batch_dir: Path) -> Path:
+    """Return the path for the incremental partial-results JSONL file."""
+    return batch_dir / "partial_results.jsonl"
+
+
+def load_partial_results(batch_dir: Path) -> list:
+    """Load already-generated results from the partial-results file.
+
+    Silently skips any corrupted lines so a truncated file after a crash
+    doesn't prevent resumption.
+    """
+    partial_path = get_partial_results_path(batch_dir)
+    if not partial_path.exists():
+        return []
+    results = []
+    with open(partial_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    results.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass  # skip corrupted tail line from a previous crash
+    return results
+
+
+def append_partial_results(batch_dir: Path, new_results: list):
+    """Append a list of newly generated result records to the partial-results file."""
+    if not new_results:
+        return
+    partial_path = get_partial_results_path(batch_dir)
+    with open(partial_path, 'a', encoding='utf-8') as f:
+        for record in new_results:
+            f.write(json.dumps(record, ensure_ascii=False) + '\n')
+        f.flush()
+        os.fsync(f.fileno())
+
+
 def _mark_batch_complete(batch_dir: Path, results: list):
     """Store results in the Files store and mark the batch as completed via batch_api."""
     batch_api.mark_batch_complete(batch_dir.name, results)
@@ -167,6 +207,19 @@ def process_batch(model, tokenizer, batch_item: dict):
     if not all_lines:
         print(f"No lines to process in {batch_dir.name}")
         return
+
+    # ── Resume: skip rows that were already processed in a previous run ──────
+    existing_results = load_partial_results(batch_dir)
+    already_done = len(existing_results)
+    if already_done > 0:
+        print(f"  Resuming batch {batch_dir.name}: "
+              f"{already_done}/{len(all_lines)} rows already done, skipping them.")
+    if already_done >= len(all_lines):
+        print(f"  All rows already processed. Finalizing batch {batch_dir.name}.")
+        _mark_batch_complete(batch_dir, existing_results)
+        return {'prompts': len(existing_results), 'sentences': 0, 'tokens': 0, 'time': 0.0}
+    all_lines = all_lines[already_done:]
+    # ─────────────────────────────────────────────────────────────────────────
 
     print(f"Processing {len(all_lines)} lines from batch {batch_dir.name}")
     
@@ -273,7 +326,7 @@ def process_batch(model, tokenizer, batch_item: dict):
 
     if os.path.exists(cache_file):
         print(f"--- Loading Shared Prefix Cache from {cache_file} ---")
-        prefix_cache, meta = load_prefix_cache(cache_file)
+        prefix_cache, _metadata = load_prefix_cache(cache_file)
         common_len = prefix_cache[0].offset if prefix_cache else 0
     else:
         prefix_cache, common_len = build_and_save_prefix_cache(
@@ -297,6 +350,7 @@ def process_batch(model, tokenizer, batch_item: dict):
     t_start = time.perf_counter()
 
     print(f"Starting batch generation: {len(prompts_text)} prompts in {num_chunks} chunks")
+    repetition_penalty_processor = make_repetition_penalty(REPETITION_PENALTY)
 
     for chunk_idx, chunk_indices in enumerate(dynamic_chunks):
         chunk_size = len(chunk_indices)
@@ -322,6 +376,7 @@ def process_batch(model, tokenizer, batch_item: dict):
         gen = BatchGenerator(
             model,
             stop_tokens=set(tokenizer.eos_token_ids),
+            logits_processors=[repetition_penalty_processor],
             completion_batch_size=chunk_size,
             prefill_batch_size=min(12, chunk_size),
             prefill_step_size=4096,
@@ -343,13 +398,14 @@ def process_batch(model, tokenizer, batch_item: dict):
         total_tokens += chunk_tokens_generated
 
         # Build output records for this chunk
+        chunk_new_results = []
         for local_idx, (uid, tokens) in enumerate(chunk_results_dict.items()):
             global_idx = chunk_indices[local_idx]
             decoded = tokenizer.decode(tokens)
             orig = line_data[global_idx]
             url = orig.get("url", "")
             body = orig.get("body", {})
-            custom_id = orig.get("custom_id", str(global_idx))
+            custom_id = orig.get("custom_id", str(global_idx + already_done))
             now = int(time.time())
 
             if url == "/v1/responses" or ("input" in body and "messages" not in body):
@@ -421,10 +477,13 @@ def process_batch(model, tokenizer, batch_item: dict):
                 # Legacy format
                 record = dict(orig)
                 record["result"] = decoded
-            all_results.append(record)
+            chunk_new_results.append(record)
+
+        # Persist this chunk's results immediately so progress survives a crash
+        append_partial_results(batch_dir, chunk_new_results)
+        all_results.extend(chunk_new_results)
 
         chunk_elapsed = time.perf_counter() - t_start
-        chunk_tps = chunk_tokens_generated / (chunk_elapsed / max(chunk_idx + 1, 1))
         print(f"    Chunk {chunk_idx + 1} done: {chunk_size} prompts, "
               f"{chunk_tokens_generated} tokens | running total: {total_tokens} tokens, "
               f"{chunk_elapsed:.2f}s elapsed")
@@ -435,7 +494,8 @@ def process_batch(model, tokenizer, batch_item: dict):
     print(f"  Batch {batch_dir.name}: {len(prompts_text)} prompts in {num_chunks} chunks, "
           f"{total_sentences} sentences, {total_tokens} tokens, {t_elapsed:.2f}s, {tps:.1f} tok/s")
 
-    # Mark batch complete only after ALL chunks have been processed
+    # Combine previously-persisted results with newly generated ones, then finalise
+    all_results = existing_results + all_results
     _mark_batch_complete(batch_dir, all_results)
 
     return {'prompts': len(prompts_text), 'sentences': total_sentences, 'tokens': total_tokens, 'time': t_elapsed}
