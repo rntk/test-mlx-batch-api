@@ -102,6 +102,8 @@ def build_and_save_prefix_cache(model, tokenizer, full_prompts_tokens, cache_fil
         print("  Warning: no common prefix found; cache will be empty.")
 
     prefix_tokens = full_prompts_tokens[0][:common_len]
+    print(f"  Prefix tokens: {prefix_tokens}")
+    print(f"  Prefix text: {tokenizer.decode(prefix_tokens)}")
     prefix_cache = cache_module.make_prompt_cache(model)
 
     t0 = time.perf_counter()
@@ -186,7 +188,7 @@ def _mark_batch_complete(batch_dir: Path, results: list):
     batch_api.mark_batch_complete(batch_dir.name, results)
 
 
-def process_batch(model, tokenizer, batch_item: dict):
+def process_batch(model, tokenizer, batch_item: dict, load_cache: bool = False):
     """Process a single batch directory (batch_api.py format)."""
     batch_dir = batch_item['batch_dir']
     input_file = batch_item['input_file_path']
@@ -324,7 +326,7 @@ def process_batch(model, tokenizer, batch_item: dict):
     base_cache_file = get_cache_file_path(batch_dir)
     cache_file = resolve_cache_file_path(base_cache_file)
 
-    if os.path.exists(cache_file):
+    if load_cache and os.path.exists(cache_file):
         print(f"--- Loading Shared Prefix Cache from {cache_file} ---")
         prefix_cache, _metadata = load_prefix_cache(cache_file)
         common_len = prefix_cache[0].offset if prefix_cache else 0
@@ -386,7 +388,7 @@ def process_batch(model, tokenizer, batch_item: dict):
         chunk_results_dict = {}
 
         with wired_limit(model, [generation_stream]):
-            uids = gen.insert(suffix_prompts, max_tokens=24000, caches=caches)
+            uids = gen.insert(suffix_prompts, max_tokens=64000, caches=caches)
             chunk_results_dict = {uid: [] for uid in uids}
 
             while responses := gen.next():
@@ -487,6 +489,15 @@ def process_batch(model, tokenizer, batch_item: dict):
         print(f"    Chunk {chunk_idx + 1} done: {chunk_size} prompts, "
               f"{chunk_tokens_generated} tokens | running total: {total_tokens} tokens, "
               f"{chunk_elapsed:.2f}s elapsed")
+        stats = gen.stats()
+        print(
+            f"[batch_generate] Prompt: {stats.prompt_tokens} tokens, {stats.prompt_tps:.3f} tokens-per-sec"
+        )
+        print(
+            f"[batch_generate] Generation: {stats.generation_tokens} tokens, "
+            f"{stats.generation_tps:.3f} tokens-per-sec"
+        )
+        print(f"[batch_generate] Peak memory: {stats.peak_memory:.3f} GB")
 
     t_elapsed = time.perf_counter() - t_start
     tps = total_tokens / t_elapsed if t_elapsed > 0 else 0.0
@@ -556,6 +567,12 @@ def main():
         default=DEFAULT_BATCHES_DIR,
         help=f"Path to the batches directory (default: {DEFAULT_BATCHES_DIR})",
     )
+    parser.add_argument(
+        "--load-cache",
+        action="store_true",
+        default=False,
+        help="Load prompt prefix cache from file if available (disabled by default)",
+    )
     args = parser.parse_args()
 
     batches_dir = Path(args.batches_dir)
@@ -583,7 +600,7 @@ def main():
                 for item in pending:
                     batch_dir = item['batch_dir']
                     print(f"--- Processing batch {batch_dir.name} ---")
-                    metrics = process_batch(model, tokenizer, item)
+                    metrics = process_batch(model, tokenizer, item, load_cache=args.load_cache)
                     total_batches += 1
                     total_prompts += metrics['prompts']
                     total_sentences += metrics['sentences']
