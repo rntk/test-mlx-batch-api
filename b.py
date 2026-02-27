@@ -257,6 +257,15 @@ def main():
                     results[r.uid].append(r.token)
                     total_tokens += 1
     t_elapsed = time.perf_counter() - t_start
+    stats = gen.stats()
+    print(
+        f"[batch_generate] Prompt: {stats.prompt_tokens} tokens, {stats.prompt_tps:.3f} tokens-per-sec"
+    )
+    print(
+        f"[batch_generate] Generation: {stats.generation_tokens} tokens, "
+        f"{stats.generation_tps:.3f} tokens-per-sec"
+    )
+    print(f"[batch_generate] Peak memory: {stats.peak_memory:.3f} GB")
 
     # Print generation metrics
     tps = total_tokens / t_elapsed if t_elapsed > 0 else 0.0
