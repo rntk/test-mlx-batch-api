@@ -25,7 +25,7 @@ REPETITION_PENALTY = 1.2
 # 48 prompts ≈ 150K tokens fits comfortably.  Here prompts can be
 # arbitrarily large, so we adapt the chunk size instead.
 MAX_CHUNK_PROMPT_TOKENS = 150_000   # total prompt tokens per chunk
-DEFAULT_MAX_CHUNK_SIZE = 48         # upper bound on prompts per chunk
+DEFAULT_MAX_CHUNK_SIZE = 20         # upper bound on prompts per chunk
 
 
 def get_cache_file_path(batch_dir: Path) -> str:
@@ -86,13 +86,12 @@ def find_common_prefix_length(token_lists):
 
 def build_and_save_prefix_cache(model, tokenizer, full_prompts_tokens, cache_file: str):
     """
-    Compute the shared-prefix KV cache from the first 2 prompts,
+    Compute the shared-prefix KV cache from all prompts,
     prefill it using model() directly, and save to disk.
     Returns (prefix_cache, common_len).
     """
-    # Use up to 2 prompts to find the common prefix
-    sample = full_prompts_tokens[:2]
-    common_len = find_common_prefix_length(sample)
+    # Use all prompts to find the common prefix
+    common_len = find_common_prefix_length(full_prompts_tokens)
 
     print(f"--- Building Shared Prefix Cache ---")
     print(f"  Common token prefix : {common_len} tokens")
