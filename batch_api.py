@@ -47,6 +47,7 @@ Typical workflow
 
 import email
 import json
+import logging
 import os
 import shutil
 import time
@@ -54,6 +55,14 @@ import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
+
+# Configure logging with date/time prefix
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -154,7 +163,7 @@ def _parse_multipart(headers, body: bytes) -> dict[str, bytes]:
 class BatchAPIHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):  # noqa: A002
-        print(f"[{self.log_date_time_string()}] {format % args}")
+        logger.info(format % args)
 
     # ------------------------------------------------------------------
     # Low-level response helpers
@@ -544,25 +553,25 @@ def mark_batch_ready(batch_id: str, results: list) -> None:
 def run_server(host: str = HOST, port: int = PORT):
     """Start the HTTP server."""
     httpd = HTTPServer((host, port), BatchAPIHandler)
-    print(f"Batch API Server  http://{host}:{port}")
-    print(f"  Files store : {FILES_DIR.absolute()}")
-    print(f"  Batches dir : {BATCHES_DIR.absolute()}")
-    print()
-    print("Files API:")
-    print("  POST   /files                    Upload a file (multipart/form-data, purpose=batch)")
-    print("  GET    /files                    List files")
-    print("  GET    /files/{id}               Retrieve file metadata")
-    print("  GET    /files/{id}/content       Download file content")
-    print("  DELETE /files/{id}               Delete a file")
-    print()
-    print("Batch API:")
-    print("  POST   /batches                  Create a batch (JSON: input_file_id, endpoint, …)")
-    print("  GET    /batches                  List batches")
-    print("  GET    /batches/{id}             Get batch status")
-    print("  POST   /batches/{id}/cancel      Cancel a batch")
-    print("  DELETE /batches/{id}             Delete a batch")
-    print()
-    print("Press Ctrl+C to stop.")
+    logger.info(f"Batch API Server  http://{host}:{port}")
+    logger.info(f"  Files store : {FILES_DIR.absolute()}")
+    logger.info(f"  Batches dir : {BATCHES_DIR.absolute()}")
+    logger.info("")
+    logger.info("Files API:")
+    logger.info("  POST   /files                    Upload a file (multipart/form-data, purpose=batch)")
+    logger.info("  GET    /files                    List files")
+    logger.info("  GET    /files/{id}               Retrieve file metadata")
+    logger.info("  GET    /files/{id}/content       Download file content")
+    logger.info("  DELETE /files/{id}               Delete a file")
+    logger.info("")
+    logger.info("Batch API:")
+    logger.info("  POST   /batches                  Create a batch (JSON: input_file_id, endpoint, …)")
+    logger.info("  GET    /batches                  List batches")
+    logger.info("  GET    /batches/{id}             Get batch status")
+    logger.info("  POST   /batches/{id}/cancel      Cancel a batch")
+    logger.info("  DELETE /batches/{id}             Delete a batch")
+    logger.info("")
+    logger.info("Press Ctrl+C to stop.")
     httpd.serve_forever()
 
 
