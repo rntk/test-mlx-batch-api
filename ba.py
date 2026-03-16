@@ -25,7 +25,7 @@ REPETITION_PENALTY = 1.2
 # 48 prompts ≈ 150K tokens fits comfortably.  Here prompts can be
 # arbitrarily large, so we adapt the chunk size instead.
 MAX_CHUNK_PROMPT_TOKENS = 150_000   # total prompt tokens per chunk
-DEFAULT_MAX_CHUNK_SIZE = 20         # upper bound on prompts per chunk
+DEFAULT_MAX_CHUNK_SIZE = 48         # upper bound on prompts per chunk
 
 
 def get_cache_file_path(batch_dir: Path) -> str:
@@ -99,6 +99,8 @@ def build_and_save_prefix_cache(model, tokenizer, full_prompts_tokens, cache_fil
 
     if common_len == 0:
         print("  Warning: no common prefix found; cache will be empty.")
+        print("  Skipping cache creation and save.")
+        return [], 0
 
     prefix_tokens = full_prompts_tokens[0][:common_len]
     print(f"  Prefix tokens: {prefix_tokens}")
@@ -321,7 +323,7 @@ def process_batch(model, tokenizer, batch_item: dict, load_cache: bool = False):
           f"avg: {sum(token_lengths)//len(token_lengths)}, total: {sum(token_lengths)}")
 
     # Handle KV cache prefix optimization — cache is kept in the batch directory
-    # Build/load prefix cache once using first 2 prompts as a sample
+    # Build/load prefix cache once using ALL prompts to find true common prefix
     base_cache_file = get_cache_file_path(batch_dir)
     cache_file = resolve_cache_file_path(base_cache_file)
 
@@ -329,10 +331,23 @@ def process_batch(model, tokenizer, batch_item: dict, load_cache: bool = False):
         print(f"--- Loading Shared Prefix Cache from {cache_file} ---")
         prefix_cache, _metadata = load_prefix_cache(cache_file)
         common_len = prefix_cache[0].offset if prefix_cache else 0
+        print(f"  Loaded cache with common_len: {common_len}")
     else:
+        # CRITICAL: Pass ALL prompts, not just a sample, to find true common prefix
+        # If only first 2 prompts are used, the computed prefix may not be common
+        # to ALL prompts in the batch, causing suffix misalignment.
         prefix_cache, common_len = build_and_save_prefix_cache(
-            model, tokenizer, all_tokens[:2], base_cache_file
+            model, tokenizer, all_tokens, base_cache_file
         )
+
+    # Validate cache offset matches computed common_len
+    if prefix_cache:
+        cached_offset = prefix_cache[0].offset
+        if cached_offset != common_len:
+            print(f"  WARNING: Cache offset ({cached_offset}) != common_len ({common_len})")
+            print(f"  This may indicate cache building issue!")
+        else:
+            print(f"  ✓ Cache offset validated: {cached_offset} tokens")
 
     # Compute dynamic chunks based on token budget
     dynamic_chunks = compute_dynamic_chunks(token_lengths)
@@ -366,12 +381,33 @@ def process_batch(model, tokenizer, batch_item: dict, load_cache: bool = False):
 
         # Build suffix prompts and clone caches for this chunk
         if common_len > 0 and chunk_size > 1:
+            # VALIDATION: Verify suffix alignment
             suffix_prompts = [toks[common_len:] for toks in chunk_tokens]
+
+            # Sanity check: ensure all chunk tokens start with the common prefix
+            for local_idx, toks in enumerate(chunk_tokens):
+                global_idx = chunk_indices[local_idx]
+                if len(toks) < common_len:
+                    print(f"    WARNING: Prompt {global_idx} has {len(toks)} tokens "
+                          f"but common_len is {common_len}!")
+                    print(f"    This prompt won't use cache optimization.")
+                elif toks[:common_len] != all_tokens[0][:common_len]:
+                    print(f"    WARNING: Prompt {global_idx} prefix mismatch!")
+                    print(f"      Expected: {all_tokens[0][:common_len][:10]}...")
+                    print(f"      Got:      {toks[:common_len][:10]}...")
+
             mx.eval([c.state for c in prefix_cache])
             caches = [clone_cache(prefix_cache) for _ in suffix_prompts]
+            print(f"    ✓ Using cache for {chunk_size} prompts:")
+            print(f"      Shared prefix: {common_len} tokens")
+            print(f"      Suffix sizes: {[len(s) for s in suffix_prompts]}")
         else:
             suffix_prompts = chunk_tokens
             caches = None
+            if common_len == 0:
+                print(f"    ⚠ No cache optimization: no common prefix found")
+            elif chunk_size == 1:
+                print(f"    ⚠ No cache optimization: single-prompt chunk")
 
         # Batch inference for this chunk
         gen = BatchGenerator(
@@ -624,3 +660,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    #batch_4ec467268c7c4173a78497442abf3850
